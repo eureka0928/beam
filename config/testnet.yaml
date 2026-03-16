@@ -1,0 +1,40 @@
+# BEAM Testnet Configuration
+# Overrides for testnet deployment (netuid 304)
+
+bittensor:
+  network: "test"
+  netuid: 304
+
+# Testnet uses relaxed validation for testing
+orchestrator:
+  min_worker_bandwidth_mbps: 1.0
+  enable_geo_verification: false
+  max_suspicious_score: 0.5
+
+  # Faster epochs for testing
+  proof_aggregation_interval: 30
+  validator_report_interval: 120
+
+validator:
+  epoch_length_seconds: 120
+  bandwidth_challenge_size: 1048576  # 1 MB for faster tests
+
+# Lower tier requirements for testnet
+client_tiers:
+  basic:
+    min_stake: 1000000000       # 1 dTAO
+    rate_limit_rpm: 60
+    daily_transfer_bytes: 10737418240  # 10 GB
+    max_concurrent: 5
+
+  standard:
+    min_stake: 10000000000      # 10 dTAO
+    rate_limit_rpm: 300
+    daily_transfer_bytes: 107374182400  # 100 GB
+    max_concurrent: 20
+
+  premium:
+    min_stake: 100000000000     # 100 dTAO
+    rate_limit_rpm: 1200
+    daily_transfer_bytes: 1099511627776  # 1 TB
+    max_concurrent: 100

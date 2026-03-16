@@ -1,0 +1,57 @@
+# BEAM Local Development Configuration
+# Use this for local testing without bittensor connection
+
+bittensor:
+  network: "local"
+  netuid: 1
+
+# Local development settings
+orchestrator:
+  local_mode: true
+  port: 8000
+
+  # Relaxed settings for development
+  min_worker_bandwidth_mbps: 0.0
+  enable_geo_verification: false
+  enable_latency_verification: false
+  max_suspicious_score: 1.0
+
+  # Fast iteration
+  proof_aggregation_interval: 10
+  validator_report_interval: 30
+  worker_timeout_seconds: 60
+
+validator:
+  port: 8001
+  epoch_length_seconds: 30
+  bandwidth_challenge_size: 102400  # 100 KB
+
+connection:
+  port: 9000
+  min_stake_dtao: 0
+
+# No stake requirements for local dev
+client_tiers:
+  basic:
+    min_stake: 0
+    rate_limit_rpm: 1000
+    daily_transfer_bytes: 1099511627776  # 1 TB
+    max_concurrent: 100
+
+  standard:
+    min_stake: 0
+    rate_limit_rpm: 1000
+    daily_transfer_bytes: 1099511627776
+    max_concurrent: 100
+
+  premium:
+    min_stake: 0
+    rate_limit_rpm: 1000
+    daily_transfer_bytes: 1099511627776
+    max_concurrent: 100
+
+database:
+  url: "postgresql+asyncpg://localhost/beam"
+
+redis:
+  url: "redis://localhost:6379/0"
