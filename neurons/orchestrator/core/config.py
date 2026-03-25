@@ -66,6 +66,13 @@ class OrchestratorSettings(BaseSettings):
     wallet_path: str = Field(default="~/.bittensor/wallets", env="WALLET_PATH")
 
     # ==========================================================================
+    # Orchestrator UID (on-chain miner slot)
+    # ==========================================================================
+    # If set, uses this UID for registration. Otherwise auto-detects from metagraph.
+    # Get your UID: btcli subnet metagraph --netuid 105 (mainnet) or 304 (testnet)
+    uid: Optional[int] = Field(default=None, env="ORCHESTRATOR_UID")
+
+    # ==========================================================================
     # Fee Settings (% of emission shared with workers)
     # ==========================================================================
     fee_percentage: float = Field(default=0.0, env="FEE_PERCENTAGE")  # 0-100%

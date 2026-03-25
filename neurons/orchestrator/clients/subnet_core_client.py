@@ -1151,7 +1151,13 @@ class SubnetCoreClient:
             return response.json()
 
         except httpx.HTTPStatusError as e:
-            logger.error(f"HTTP error listing workers: {e.response.status_code}")
+            # Extract response body for better error messages (e.g., rate limit details)
+            try:
+                error_detail = e.response.json().get("detail", {})
+                error_msg = error_detail.get("message", str(e))
+            except Exception:
+                error_msg = e.response.text[:200] if e.response.text else str(e)
+            logger.error(f"HTTP error listing workers: {e.response.status_code} - {error_msg}")
             raise
         except Exception as e:
             logger.error(f"Error listing workers: {e}")

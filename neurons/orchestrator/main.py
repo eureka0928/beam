@@ -75,7 +75,7 @@ def _sign_message(wallet, message: str) -> str:
         return ""
 
 
-async def _connect_and_register_ws(settings, wallet, get_worker_count, get_balance_info=None):
+async def _connect_and_register_ws(settings, wallet, get_worker_count, get_balance_info=None, get_uid=None):
     """
     Connect to BeamCore via WebSocket and register/send heartbeats.
 
@@ -140,12 +140,17 @@ async def _connect_and_register_ws(settings, wallet, get_worker_count, get_balan
                 reg_message = f"{hotkey}:{orch_url}:{settings.region}"
                 reg_signature = _sign_message(wallet, reg_message)
 
+                # Get UID: prefer env var, fallback to metagraph detection
+                uid = settings.uid  # From ORCHESTRATOR_UID env var
+                if uid is None and get_uid is not None:
+                    uid = get_uid()  # From metagraph detection
+
                 register_msg = {
                     "type": "register",
                     "url": orch_url,
                     "region": settings.region,
                     "max_workers": settings.max_workers,
-                    "uid": None,  # Will be set by BeamCore from metagraph
+                    "uid": uid,
                     "fee_percentage": settings.fee_percentage,
                     "signature": reg_signature,
                 }
@@ -407,6 +412,10 @@ async def lifespan(app: FastAPI):
             pass
         return balance, coldkey_balance, pending
 
+    def _get_uid():
+        """Get UID from metagraph detection."""
+        return orchestrator.our_uid
+
     # Start WebSocket connection task (handles registration + heartbeats)
     _core_api_ws_task = asyncio.create_task(
         _connect_and_register_ws(
@@ -414,6 +423,7 @@ async def lifespan(app: FastAPI):
             orchestrator.wallet,
             _get_worker_count,
             _get_balance_info,
+            _get_uid,
         )
     )
     logger.info("Started BeamCore WebSocket connection task")
