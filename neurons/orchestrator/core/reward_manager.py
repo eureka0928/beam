@@ -75,6 +75,10 @@ class RewardManager:
         self.last_emission_check: float = 0.0
         self.epoch_start_emission: float = 0.0
 
+        # Payment success/failure counters for monitoring
+        self._payment_success_count: int = 0
+        self._payment_failure_count: int = 0
+
         # Per-epoch accumulators for epoch summary reporting
         self._epoch_totals: Dict[int, Dict[str, Any]] = {}  # epoch -> {distributed_nano, worker_ids, bytes_relayed}
 
@@ -194,10 +198,10 @@ class RewardManager:
 
         if wallet and subtensor:
             try:
-                # Cache balance for 30s to avoid concurrent subtensor websocket calls
+                # Cache balance for 10s to keep spending accurate under high throughput
                 import time as _time
                 now = _time.time()
-                if not hasattr(self, '_cached_balance') or (now - getattr(self, '_cached_balance_at', 0)) > 30:
+                if not hasattr(self, '_cached_balance') or (now - getattr(self, '_cached_balance_at', 0)) > 10:
                     self._cached_balance = float(subtensor.get_balance(wallet.hotkey.ss58_address))
                     self._cached_balance_at = now
                 available = self._cached_balance
@@ -310,6 +314,21 @@ class RewardManager:
 
                 if tx_hash:
                     transfer_success = True
+                    # Extract real blockchain tx hash from ExtrinsicResponse
+                    tx_hash = None
+                    block_hash = None
+                    if hasattr(response, 'extrinsic_receipt') and response.extrinsic_receipt:
+                        receipt = response.extrinsic_receipt
+                        if hasattr(receipt, 'extrinsic_hash') and receipt.extrinsic_hash:
+                            tx_hash = str(receipt.extrinsic_hash)
+                        if hasattr(receipt, 'block_hash') and receipt.block_hash:
+                            block_hash = str(receipt.block_hash)
+                    if not tx_hash:
+                        tx_hash = f"transfer:{hotkey[:8]}:{payment_dest[:8]}:{int(time.time())}"
+                        logger.warning(f"Could not extract real tx hash from response: {type(response)}")
+                    elif block_hash:
+                        tx_hash = f"{tx_hash}:{block_hash}"
+                    self._payment_success_count += 1
                     # Record payment on PoB record via BeamCore
                     if SUBNET_CORE_CLIENT_AVAILABLE and subnet_core_client:
                         try:
@@ -325,12 +344,14 @@ class RewardManager:
                         f"transfer={transfer_id} tx={tx_hash[:24]}..."
                     )
                 else:
+                    self._payment_failure_count += 1
                     logger.error(
                         f"ALPHA payment FAILED for task {proof.task_id[:16]}... — queuing for retry"
                     )
                     self._queue_failed_payment(worker, proof, reward)
 
             except Exception as e:
+                self._payment_failure_count += 1
                 logger.error(f"Error in ALPHA payment: {e}", exc_info=True)
                 self._queue_failed_payment(worker, proof, reward)
 

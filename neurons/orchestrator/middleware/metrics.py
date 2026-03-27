@@ -253,6 +253,32 @@ UPTIME = Gauge(
     "Service uptime in seconds",
 )
 
+# Weight formula component gauges
+PROOFS_PUBLISHED = Gauge(
+    "beam_proofs_published_total",
+    "Total proofs successfully published to BeamCore",
+)
+PROOFS_FAILED = Gauge(
+    "beam_proofs_failed_total",
+    "Total proofs that failed to publish",
+)
+VERIFICATION_RATE = Gauge(
+    "beam_verification_rate",
+    "Estimated proof verification rate (0-1)",
+)
+BYTES_RELAYED_EPOCH = Gauge(
+    "beam_bytes_relayed_epoch",
+    "Bytes relayed in current epoch",
+)
+PAYMENT_SUCCESS_RATE = Gauge(
+    "beam_payment_success_rate",
+    "Worker payment success rate (0-1)",
+)
+BALANCE_TAO = Gauge(
+    "beam_balance_tao",
+    "Current hotkey wallet balance in TAO",
+)
+
 
 # =============================================================================
 # Metrics Collector
@@ -363,6 +389,18 @@ class MetricsCollector:
             EPOCH_NUMBER.set(state.get("current_epoch", 0))
             EPOCH_TASKS.set(state.get("epoch_tasks", 0))
             EPOCH_BYTES.set(state.get("epoch_bytes", 0))
+
+            # Weight formula component metrics
+            if hasattr(self.orchestrator, 'get_weight_estimate'):
+                try:
+                    west = self.orchestrator.get_weight_estimate()
+                    PROOFS_PUBLISHED.set(west.get("proofs_published", 0))
+                    PROOFS_FAILED.set(west.get("proofs_failed", 0))
+                    VERIFICATION_RATE.set(west.get("estimated_verification_rate", 0))
+                    BYTES_RELAYED_EPOCH.set(west.get("bytes_relayed_total", 0))
+                    PAYMENT_SUCCESS_RATE.set(west.get("payment_success_rate", 0))
+                except Exception as e:
+                    logger.debug(f"Failed to collect weight metrics: {e}")
 
     # =========================================================================
     # Public Metric Update Methods

@@ -28,6 +28,7 @@ not directly to orchestrators.
 import asyncio
 import logging
 import os
+import random
 import signal
 import socket
 import sys
@@ -239,6 +240,10 @@ async def _handle_transfer_assigned(
         )
 
 
+# Grep-friendly prefix for BeamCore orchestrator registration / register_result lines
+BEAMCORE_REGISTER_LOG = "[BEAMCORE_REGISTER]"
+
+
 async def _connect_and_register_ws(settings, wallet, get_worker_count, get_balance_info=None, get_uid=None):
     """
     Connect to BeamCore via WebSocket and register/send heartbeats.
@@ -268,7 +273,7 @@ async def _connect_and_register_ws(settings, wallet, get_worker_count, get_balan
     ws_endpoint = f"{ws_url}/ws/orchestrators/{hotkey}"
 
     heartbeat_interval = 60  # seconds
-    reconnect_delay = 5  # seconds
+    retry_count = 0
 
     while True:
         try:
@@ -281,6 +286,8 @@ async def _connect_and_register_ws(settings, wallet, get_worker_count, get_balan
                 "x-signature": signature,
                 "x-timestamp": timestamp,
             }
+            if api_key:
+                headers["x-api-key"] = api_key
 
             logger.info(f"Connecting to BeamCore WebSocket: {ws_endpoint}")
 
@@ -297,10 +304,18 @@ async def _connect_and_register_ws(settings, wallet, get_worker_count, get_balan
                 try:
                     connected_msg = await asyncio.wait_for(ws.recv(), timeout=10)
                     connected_data = json.loads(connected_msg)
+                    logger.info(
+                        f"{BEAMCORE_REGISTER_LOG} first_frame type={connected_data.get('type')!r} "
+                        f"payload={connected_data}"
+                    )
                     if connected_data.get("type") == "connected":
-                        logger.info(f"BeamCore connection confirmed: buffer={connected_data.get('buffer_id')}")
+                        logger.info(
+                            f"{BEAMCORE_REGISTER_LOG} connected: buffer_id={connected_data.get('buffer_id')!r}"
+                        )
                 except asyncio.TimeoutError:
-                    logger.warning("Timeout waiting for connected message")
+                    logger.warning(f"{BEAMCORE_REGISTER_LOG} timeout waiting for first server frame after connect")
+                except json.JSONDecodeError as e:
+                    logger.warning(f"{BEAMCORE_REGISTER_LOG} invalid JSON in first frame: {e}")
 
                 # Send registration message
                 local_ip = settings.external_ip or _get_local_ip()
@@ -326,20 +341,84 @@ async def _connect_and_register_ws(settings, wallet, get_worker_count, get_balan
                 }
 
                 await ws.send(json.dumps(register_msg))
-                logger.info(f"Sent registration via WebSocket: region={settings.region}, fee={settings.fee_percentage}%")
+                logger.info(
+                    f"{BEAMCORE_REGISTER_LOG} sent_register: region={settings.region} "
+                    f"fee={settings.fee_percentage}% uid={uid} url={orch_url} "
+                    f"(signature omitted)"
+                )
 
-                # Wait for registration acknowledgment
-                try:
-                    reg_response = await asyncio.wait_for(ws.recv(), timeout=10)
-                    reg_data = json.loads(reg_response)
-                    if reg_data.get("type") == "register_ack":
-                        logger.info(f"Registration acknowledged: {reg_data.get('status')}")
-                    elif reg_data.get("type") == "register_error":
-                        logger.error(f"Registration failed: {reg_data.get('error')}")
-                    elif reg_data.get("type") == "register_result":
-                        logger.info(f"Registration result: status={reg_data.get('status')}, slot={reg_data.get('slot_number')}")
-                except asyncio.TimeoutError:
-                    logger.warning("Timeout waiting for registration ack (continuing anyway)")
+                # BeamCore may send register_ack first and register_result (with slot_number) second — read until done
+                loop_time = asyncio.get_event_loop().time
+                reg_deadline = loop_time() + 25.0
+                reg_terminal = False
+                saw_register_ack = False
+                saw_register_result = False
+                reg_inbound_count = 0
+                while loop_time() < reg_deadline and not reg_terminal:
+                    try:
+                        remaining = max(0.1, reg_deadline - loop_time())
+                        reg_response = await asyncio.wait_for(ws.recv(), timeout=min(remaining, 10.0))
+                    except asyncio.TimeoutError:
+                        continue
+                    reg_inbound_count += 1
+                    try:
+                        reg_data = json.loads(reg_response)
+                    except json.JSONDecodeError as e:
+                        raw = reg_response[:500] if isinstance(reg_response, str) else repr(reg_response)[:500]
+                        logger.warning(
+                            f"{BEAMCORE_REGISTER_LOG} non_json_frame n={reg_inbound_count} err={e} raw_prefix={raw!r}"
+                        )
+                        continue
+                    msg_type = reg_data.get("type")
+                    logger.info(
+                        f"{BEAMCORE_REGISTER_LOG} inbound_ws n={reg_inbound_count} type={msg_type!r} "
+                        f"payload={reg_data}"
+                    )
+                    if msg_type == "register_ack":
+                        saw_register_ack = True
+                        logger.info(
+                            f"{BEAMCORE_REGISTER_LOG} register_ack status={reg_data.get('status')!r}"
+                        )
+                    elif msg_type == "register_error":
+                        logger.error(
+                            f"{BEAMCORE_REGISTER_LOG} register_error: {reg_data.get('error')} full={reg_data}"
+                        )
+                        reg_terminal = True
+                    elif msg_type == "register_result":
+                        saw_register_result = True
+                        status = reg_data.get("status")
+                        slot = reg_data.get("slot_number")
+                        logger.info(
+                            f"{BEAMCORE_REGISTER_LOG} register_result: status={status!r} "
+                            f"slot_number={slot!r} full={reg_data}"
+                        )
+                        reg_terminal = True
+                    else:
+                        logger.info(
+                            f"{BEAMCORE_REGISTER_LOG} inbound_non_terminal (still waiting for "
+                            f"register_result/register_error): type={msg_type!r}"
+                        )
+                logger.info(
+                    f"{BEAMCORE_REGISTER_LOG} registration_phase_summary: "
+                    f"frames_seen={reg_inbound_count} "
+                    f"register_ack={saw_register_ack} "
+                    f"register_result={saw_register_result} "
+                    f"terminal={reg_terminal}"
+                )
+                if not reg_terminal:
+                    if saw_register_ack:
+                        logger.info(
+                            f"{BEAMCORE_REGISTER_LOG} no register_result within 25s after register_ack — "
+                            f"BeamCore may omit slot_number; watch for a later {BEAMCORE_REGISTER_LOG} register_result line"
+                        )
+                    else:
+                        logger.warning(
+                            f"{BEAMCORE_REGISTER_LOG} no register_ack/register_result/error in registration window — "
+                            f"check auth, on-chain registration, EXTERNAL_IP, and orchestrator URL reachability"
+                        )
+
+                # Connected successfully — reset retry counter
+                retry_count = 0
 
                 # Heartbeat loop
                 loop = asyncio.get_event_loop()
@@ -400,7 +479,11 @@ async def _connect_and_register_ws(settings, wallet, get_worker_count, get_balan
                             elif msg_type == "chunks_queued":
                                 logger.info(f"Chunks queued: assignment={data.get('assignment_id')} count={data.get('task_count')}")
                             elif msg_type == "register_result":
-                                logger.info(f"Registration result: {data}")
+                                logger.info(
+                                    f"{BEAMCORE_REGISTER_LOG} register_result (post_handshake): "
+                                    f"status={data.get('status')!r} slot_number={data.get('slot_number')!r} "
+                                    f"full={data}"
+                                )
                             elif msg_type == "error":
                                 logger.warning(f"BeamCore error: {data.get('message')}")
                             else:
@@ -419,7 +502,9 @@ async def _connect_and_register_ws(settings, wallet, get_worker_count, get_balan
             logger.error(f"BeamCore WebSocket connection failed: {e}")
 
         _core_api_ws = None
-        logger.info(f"Reconnecting to BeamCore in {reconnect_delay}s...")
+        reconnect_delay = min(5 * (1.5 ** retry_count) + random.uniform(0, 2), 60)
+        retry_count += 1
+        logger.info(f"Reconnecting to BeamCore in {reconnect_delay:.1f}s (attempt {retry_count})...")
         await asyncio.sleep(reconnect_delay)
 
 
@@ -760,6 +845,14 @@ async def metrics_json():
         "orchestrator": orchestrator.get_state() if orchestrator else {},
         "rate_limiter": rate_limiter.get_stats(),
     }
+
+
+@app.get("/weights/estimate")
+async def weight_estimate():
+    """Estimate current weight formula components for emission monitoring."""
+    if orchestrator:
+        return orchestrator.get_weight_estimate()
+    return {"error": "Orchestrator not initialized"}
 
 
 # Cluster endpoints removed - standalone mode only
