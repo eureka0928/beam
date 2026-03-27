@@ -97,8 +97,9 @@ class OrchestratorSettings(BaseSettings):
     # ==========================================================================
     max_workers: int = Field(default=10000, env="MAX_WORKERS")
     worker_timeout_seconds: int = Field(default=300, env="WORKER_TIMEOUT")
-    min_worker_bandwidth_mbps: float = Field(default=10.0, env="MIN_WORKER_BANDWIDTH")
+    min_worker_bandwidth_mbps: float = Field(default=1.0, env="MIN_WORKER_BANDWIDTH")
     worker_heartbeat_interval: int = Field(default=30, env="WORKER_HEARTBEAT_INTERVAL")
+    worker_sync_interval: int = Field(default=30, env="WORKER_SYNC_INTERVAL")
 
     # ==========================================================================
     # Task Settings
@@ -110,8 +111,8 @@ class OrchestratorSettings(BaseSettings):
     # ==========================================================================
     # Proof Aggregation
     # ==========================================================================
-    proof_batch_size: int = Field(default=100, env="PROOF_BATCH_SIZE")
-    proof_aggregation_interval: int = Field(default=60, env="PROOF_AGGREGATION_INTERVAL")
+    proof_batch_size: int = Field(default=50, env="PROOF_BATCH_SIZE")
+    proof_aggregation_interval: int = Field(default=15, env="PROOF_AGGREGATION_INTERVAL")
     min_proofs_for_epoch: int = Field(default=10, env="MIN_PROOFS_FOR_EPOCH")
 
     # ==========================================================================
@@ -172,11 +173,11 @@ class OrchestratorSettings(BaseSettings):
     # ==========================================================================
     # Worker Scoring Weights (for selection)
     # ==========================================================================
-    weight_trust: float = Field(default=0.30, env="WEIGHT_TRUST")
-    weight_latency: float = Field(default=0.25, env="WEIGHT_LATENCY")
-    weight_load: float = Field(default=0.20, env="WEIGHT_LOAD")
-    weight_bandwidth: float = Field(default=0.15, env="WEIGHT_BANDWIDTH")
-    weight_success: float = Field(default=0.10, env="WEIGHT_SUCCESS")
+    weight_trust: float = Field(default=0.15, env="WEIGHT_TRUST")
+    weight_latency: float = Field(default=0.10, env="WEIGHT_LATENCY")
+    weight_load: float = Field(default=0.30, env="WEIGHT_LOAD")
+    weight_bandwidth: float = Field(default=0.30, env="WEIGHT_BANDWIDTH")
+    weight_success: float = Field(default=0.15, env="WEIGHT_SUCCESS")
 
     # ==========================================================================
     # Reward Distribution Weights (for epoch-end payment calculation)

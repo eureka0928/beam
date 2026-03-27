@@ -318,6 +318,7 @@ class SubnetCoreClient:
 
         # WebSocket registration state
         self._registered = False
+        self._registration_slot: Optional[int] = None
         self._registration_config: Optional[Dict[str, Any]] = None
 
         # API key authentication (for buffer service)
@@ -656,6 +657,7 @@ class SubnetCoreClient:
         )
         self._ws_connected = True
         self._registered = False  # Reset on new connection
+        self._registration_slot = None
         logger.info(f"WebSocket connected to {url}")
 
         # Auto-register if config is set
@@ -666,6 +668,11 @@ class SubnetCoreClient:
                 max_workers=self._registration_config["max_workers"],
                 uid=self._registration_config["uid"],
                 fee_percentage=self._registration_config["fee_percentage"],
+            )
+        else:
+            logger.warning(
+                "No registration config set - orchestrator will NOT register via WebSocket. "
+                "Call set_registration_config() before start_polling()."
             )
 
     async def _ws_message_loop(self):
@@ -759,14 +766,42 @@ class SubnetCoreClient:
             logger.debug("WebSocket heartbeat acknowledged")
 
         elif msg_type == "register_ack":
-            logger.info(f"Registration acknowledged: {data.get('status')}")
-            self._registered = True
+            # Ack only means the server received the message, NOT that registration succeeded.
+            # Wait for register_result to determine actual registration state.
+            logger.info(f"Registration acknowledged (pending result): {data.get('status')}")
 
         elif msg_type == "register_result":
             status = data.get("status")
             slot = data.get("slot_number")
-            logger.info(f"Registration result: status={status}, slot={slot}")
-            self._registered = status in ("assigned", "updated")
+            info = data.get("info", {})
+
+            if status in ("assigned", "updated"):
+                # Slot confirmed — this is the authoritative success signal
+                self._registered = True
+                self._registration_slot = slot
+                stake_tao = info.get("stake_tao", "?")
+                logger.info(f"Registration {status}: slot={slot}, stake={stake_tao} TAO")
+            elif status == "insufficient_stake":
+                # BeamCore may send multiple results (TAO pass + alpha fail).
+                # If we already have a slot, keep registered and just warn.
+                required = info.get("required_stake", "?")
+                yours = info.get("your_stake", "?")
+                reason = info.get("reason", "")
+                if self._registered:
+                    logger.warning(
+                        f"Insufficient alpha stake warning (slot {self._registration_slot} "
+                        f"still active): yours={yours}, required={required}. {reason}"
+                    )
+                else:
+                    logger.warning(
+                        f"Registration failed: insufficient stake "
+                        f"(yours={yours}, required={required}). {reason}"
+                    )
+            else:
+                if not self._registered:
+                    logger.warning(f"Registration not accepted: status={status}, slot={slot}, info={info}")
+                else:
+                    logger.info(f"Registration result: status={status}, slot={slot}, info={info}")
 
         elif msg_type == "register_error":
             logger.error(f"Registration failed: {data.get('error')}")
@@ -916,7 +951,10 @@ class SubnetCoreClient:
 
         try:
             await self._ws.send(json.dumps(message))
-            logger.info(f"Sent registration via WebSocket: region={region}, fee={fee_percentage}%")
+            logger.info(
+                f"Sent registration via WebSocket: uid={uid}, region={region}, "
+                f"fee={fee_percentage}%, url={url}, hotkey={self.orchestrator_hotkey[:16]}..."
+            )
             return True
         except Exception as e:
             logger.error(f"Failed to send registration via WebSocket: {e}")
