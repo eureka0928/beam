@@ -289,7 +289,7 @@ class ProofAggregator:
                 proof.worker_id.encode("utf-8") +
                 proof.bytes_relayed.to_bytes(8, "big") +
                 int(proof.bandwidth_mbps * 1000).to_bytes(8, "big") +
-                int(proof.start_time).to_bytes(8, "big")
+                int(proof.start_time_us).to_bytes(8, "big")
             )
             proof_leaves.append(sha256(leaf_data))
 
