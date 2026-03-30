@@ -697,21 +697,10 @@ async def lifespan(app: FastAPI):
         """Get UID from metagraph detection."""
         return orchestrator.our_uid
 
-    # Register with BeamCore to get a slot
-    api_key = None
-    if orchestrator.subnet_core_client:
-        api_key = orchestrator.subnet_core_client._api_key
-        logger.info(f"Got API key for registration: {api_key[:20] if api_key else 'None'}...")
-    else:
-        logger.warning("No subnet_core_client available for registration")
-    registered = await _register_with_core_api(settings, orchestrator.hotkey, orchestrator.our_uid, api_key)
-    if registered:
-        logger.info("Successfully registered with BeamCore - slot assigned")
-    else:
-        logger.warning("Failed to register with BeamCore - may not have a slot")
-
-    # NOTE: WebSocket connection is handled by SubnetCoreClient
-    logger.info("WebSocket connection handled by SubnetCoreClient")
+    # Registration is handled by SubnetCoreClient via WebSocket (set_registration_config)
+    # Do NOT also call _register_with_core_api() — dual registration confuses BeamCore
+    # about which connection should receive transfer assignments
+    logger.info("Registration and WebSocket handled by SubnetCoreClient")
 
     # Signal readiness to receive transfers (controlled by READY env var / config)
     if settings.ready and orchestrator.subnet_core_client:
@@ -791,6 +780,10 @@ if _cors_origins:
 # Mount route modules
 app.include_router(health.router)
 app.include_router(orchestrators.router)
+
+# Validator endpoints (proof-ids, summary, challenge)
+from routes import validators
+app.include_router(validators.router)
 
 
 # =============================================================================
