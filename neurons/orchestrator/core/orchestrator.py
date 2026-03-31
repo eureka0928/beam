@@ -1304,6 +1304,49 @@ class Orchestrator:
             except asyncio.CancelledError:
                 break
 
+    async def _handle_stale_task_ws(self, data: dict) -> None:
+        """Handle stale task notification pushed via WebSocket from BeamCore.
+
+        Selects an alternative worker and reassigns the task.
+        Reuses the same selection/reassignment logic as the polling loop.
+        """
+        task_id = data.get("task_id")
+        original_worker_id = data.get("worker_id")
+
+        if not task_id:
+            return
+
+        worker_short = f"{original_worker_id[:16]}..." if original_worker_id else "none"
+        logger.info(f"Stale task notification: {task_id[:16]}... (worker={worker_short})")
+
+        try:
+            workers_response = await self.subnet_core_client.list_workers(status="active")
+            all_workers = workers_response.get("workers", [])
+
+            available_workers = self._filter_workers_with_recent_heartbeat(
+                all_workers, max_age_seconds=60
+            )
+
+            if not available_workers:
+                logger.warning(f"No workers available for stale task {task_id[:16]}...")
+                return
+
+            new_worker = self._select_worker_for_reassignment(
+                available_workers, exclude_worker_id=original_worker_id
+            )
+
+            if not new_worker:
+                logger.warning(f"No alternative worker for stale task {task_id[:16]}...")
+                return
+
+            new_worker_id = new_worker.get("worker_id")
+            await self.subnet_core_client.reassign_task(task_id, new_worker_id)
+            logger.info(
+                f"Reassigned stale task {task_id[:16]}... to {new_worker_id[:16]}..."
+            )
+        except Exception as e:
+            logger.error(f"Failed to reassign stale task {task_id[:16]}...: {e}")
+
     async def _stale_task_reassignment_loop(self) -> None:
         """
         Background loop for reassigning stale tasks to new workers.
@@ -1488,7 +1531,8 @@ class Orchestrator:
             "pending_proofs": len(self.pending_proofs),
             "total_bytes_relayed": self.total_bytes_relayed,
             "total_tasks_completed": self.total_tasks_completed,
-            # validators_known removed - BeamCore handles PoB centrally
+            "registered": self.subnet_core_client.is_registered if self.subnet_core_client else False,
+            "registration_slot": self.subnet_core_client.registration_slot if self.subnet_core_client else None,
         }
 
     def get_worker_stats(self) -> List[dict]:
@@ -1584,9 +1628,10 @@ class Orchestrator:
             else:
                 logger.warning("SubnetCoreClient health check failed - service may be unavailable")
 
-            # Set up handlers for HTTP polling
+            # Set up handlers for WebSocket notifications
             self.subnet_core_client.set_task_completion_handler(self._handle_task_completion_notification)
             self.subnet_core_client.set_transfer_handler(self._handle_transfer_notification)
+            self.subnet_core_client.set_stale_task_handler(self._handle_stale_task_ws)
             self.subnet_core_client.set_stats_provider(self._get_heartbeat_stats)
             self.subnet_core_client.set_worker_update_handler(self._worker_mgr.handle_worker_update)
 
@@ -1789,7 +1834,7 @@ class Orchestrator:
 
     async def _handle_transfer_notification(self, transfer: dict) -> None:
         """
-        Handle transfer notification from SubnetCore HTTP polling.
+        Handle transfer notification from SubnetCore via WebSocket.
 
         When a new transfer is registered, the orchestrator:
         1. Extracts transfer info (gateway_url, destination_url, chunks)
@@ -1799,6 +1844,8 @@ class Orchestrator:
 
         SubnetCore then notifies workers of their task assignments.
         """
+        _t0 = time.monotonic()
+
         transfer_id = transfer.get("transfer_id", "")
         gateway_url = transfer.get("gateway_url", "")
         object_id = transfer.get("object_id", "")
@@ -1898,9 +1945,10 @@ class Orchestrator:
             pushed = result.get('tasks_pushed', 0)
             already_assigned = result.get('already_assigned_count', 0)
 
+            _elapsed_ms = (time.monotonic() - _t0) * 1000
             logger.info(
                 f"Posted assignments for transfer {transfer_id[:16]}...: "
-                f"created={created} pushed={pushed}"
+                f"created={created} pushed={pushed} elapsed={_elapsed_ms:.0f}ms"
             )
 
             # Cache task metadata so completion handler has real data
@@ -1937,7 +1985,8 @@ class Orchestrator:
                 )
 
         except Exception as e:
-            logger.error(f"Failed to post assignments for transfer {transfer_id[:16]}...: {e}")
+            _elapsed_ms = (time.monotonic() - _t0) * 1000
+            logger.error(f"Failed to post assignments for transfer {transfer_id[:16]}... ({_elapsed_ms:.0f}ms): {e}")
 
     def _assign_chunks_to_workers(
         self,

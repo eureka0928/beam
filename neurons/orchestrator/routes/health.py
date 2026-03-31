@@ -116,8 +116,9 @@ async def get_metrics(
     # Epoch metrics
     metrics.append(f"beam_current_epoch {state['current_epoch']}")
 
-    # Validator metrics
-    metrics.append(f"beam_validators_known {state['validators_known']}")
+    # Registration metrics
+    metrics.append(f"beam_registered {1 if state.get('registered') else 0}")
+    metrics.append(f"beam_registration_slot {state.get('registration_slot', -1)}")
 
     return "\n".join(metrics)
 

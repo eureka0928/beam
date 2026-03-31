@@ -320,6 +320,7 @@ class SubnetCoreClient:
         self._registered = False
         self._registration_slot: Optional[int] = None
         self._registration_config: Optional[Dict[str, Any]] = None
+        self._registration_retry_active = False
 
         # API key authentication (for buffer service)
         self._api_key: Optional[str] = None
@@ -328,6 +329,16 @@ class SubnetCoreClient:
 
         # Pending worker-list requests keyed by transfer_id (WS protocol)
         self._worker_list_futures: dict[str, asyncio.Future] = {}
+
+    @property
+    def is_registered(self) -> bool:
+        """Whether the orchestrator is currently registered with BeamCore."""
+        return self._registered
+
+    @property
+    def registration_slot(self) -> Optional[int]:
+        """The slot number assigned by BeamCore, or None if not registered."""
+        return self._registration_slot
 
     # =========================================================================
     # Handlers for polling notifications
@@ -531,6 +542,12 @@ class SubnetCoreClient:
 
         self._running = True
 
+        # Pre-warm API key so first HTTP POST doesn't stall with auth negotiation
+        try:
+            await self._ensure_api_key()
+        except Exception as e:
+            logger.warning(f"Failed to pre-warm API key: {e}")
+
         # Start WebSocket connection (handles transfers, results, stale tasks)
         self._ws_task = asyncio.create_task(self._ws_connection_loop())
 
@@ -685,6 +702,13 @@ class SubnetCoreClient:
             except json.JSONDecodeError as e:
                 logger.warning(f"Invalid JSON from WebSocket: {e}")
 
+    async def _safe_transfer_handler(self, data: dict):
+        """Wrapper for fire-and-forget transfer handling with error capture."""
+        try:
+            await self._transfer_handler(data)
+        except Exception as e:
+            logger.error(f"Error handling transfer {data.get('transfer_id', '?')}: {e}")
+
     async def _handle_ws_message(self, data: dict):
         """Handle incoming WebSocket message."""
         msg_type = data.get("type")
@@ -694,23 +718,19 @@ class SubnetCoreClient:
 
         elif msg_type == "transfer_assignment":
             # New transfer to process (single assignment)
+            # Fire-and-forget: don't block WS loop — we need to claim chunks ASAP
             logger.info(f"Received transfer assignment: {data.get('transfer_id')}")
             if self._transfer_handler:
-                try:
-                    await self._transfer_handler(data)
-                except Exception as e:
-                    logger.error(f"Error handling transfer: {e}")
+                asyncio.create_task(self._safe_transfer_handler(data))
 
         elif msg_type == "transfer_assignments":
             # Batch of transfer assignments (multiple src×dest combos)
+            # Process ALL concurrently to maximize chunk-claim speed
             assignments = data.get("assignments", [])
             logger.info(f"Received {len(assignments)} batched transfer assignments")
             if self._transfer_handler:
                 for assignment in assignments:
-                    try:
-                        await self._transfer_handler(assignment)
-                    except Exception as e:
-                        logger.error(f"Error handling batched transfer: {e}")
+                    asyncio.create_task(self._safe_transfer_handler(assignment))
 
         elif msg_type == "task_result":
             # Task completion notification
@@ -797,6 +817,9 @@ class SubnetCoreClient:
                         f"Registration failed: insufficient stake "
                         f"(yours={yours}, required={required}). {reason}"
                     )
+                    # Stake cache may be stale — retry registration with backoff
+                    if not self._registration_retry_active:
+                        asyncio.create_task(self._retry_registration())
             else:
                 if not self._registered:
                     logger.warning(f"Registration not accepted: status={status}, slot={slot}, info={info}")
@@ -959,6 +982,56 @@ class SubnetCoreClient:
         except Exception as e:
             logger.error(f"Failed to send registration via WebSocket: {e}")
             return False
+
+    async def _retry_registration(self, max_retries: int = 5, base_delay: float = 30.0):
+        """Retry registration with exponential backoff when stake check fails.
+
+        BeamCore's alpha stake cache can be temporarily stale. A retry
+        30-60s later usually succeeds once the cache refreshes.
+        """
+        self._registration_retry_active = True
+        try:
+            for attempt in range(max_retries):
+                delay = base_delay * (2 ** attempt)  # 30s, 60s, 120s, 240s, 480s
+                logger.info(
+                    f"Will retry registration in {delay:.0f}s "
+                    f"(attempt {attempt + 1}/{max_retries})"
+                )
+                await asyncio.sleep(delay)
+
+                if not self._running:
+                    logger.info("Shutting down, aborting registration retry")
+                    return
+
+                if self._registered:
+                    logger.info("Registration succeeded during retry wait, aborting retries")
+                    return
+
+                if not self._ws or not self._ws_connected:
+                    logger.warning("WebSocket not connected, aborting registration retry")
+                    return
+
+                if not self._registration_config:
+                    logger.warning("No registration config, aborting retry")
+                    return
+
+                logger.info(f"Retrying registration (attempt {attempt + 1}/{max_retries})")
+                await self.register_via_websocket(
+                    url=self._registration_config["url"],
+                    region=self._registration_config["region"],
+                    max_workers=self._registration_config["max_workers"],
+                    uid=self._registration_config["uid"],
+                    fee_percentage=self._registration_config["fee_percentage"],
+                )
+                # Wait for register_result from BeamCore
+                await asyncio.sleep(10)
+                if self._registered:
+                    logger.info(f"Registration retry succeeded on attempt {attempt + 1}")
+                    return
+
+            logger.error(f"Registration failed after {max_retries} retries")
+        finally:
+            self._registration_retry_active = False
 
     async def _heartbeat_loop(self, interval: float):
         """Send periodic heartbeats via WebSocket."""
@@ -1191,6 +1264,7 @@ class SubnetCoreClient:
             response = await client.post(
                 f"{self.base_url}/orchestrators/assignments",
                 json=body,
+                timeout=5.0,  # Tight timeout: if it takes longer, the race is lost
             )
             response.raise_for_status()
             return response.json()
