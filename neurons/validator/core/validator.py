@@ -630,10 +630,12 @@ class Validator:
                 await self._query_orchestrators()
 
                 # Generate and send bandwidth challenges
-                await self._generate_and_send_challenges()
+                # DISABLED: Challenges temporarily disabled - endpoint deprecated
+                # await self._generate_and_send_challenges()
 
                 # Issue additional challenges
-                await self._issue_challenges()
+                # DISABLED: Challenges temporarily disabled - endpoint deprecated
+                # await self._issue_challenges()
 
                 # Collect and verify PoB
                 await self._collect_pob_results()
