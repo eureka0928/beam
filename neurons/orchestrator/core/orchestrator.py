@@ -1706,6 +1706,10 @@ class Orchestrator:
                     except Exception as e:
                         logger.warning(f"Worker hotkey lookup failed for {worker_id}: {e}")
 
+            # Use worker_id as fallback if hotkey unavailable (anonymous workers)
+            if not worker_hotkey:
+                worker_hotkey = worker_id
+
             if worker_hotkey:
                 # Use timing from message if available, otherwise estimate
                 start_time_us = message.get("start_time_us", 0)
@@ -1738,6 +1742,21 @@ class Orchestrator:
                     canary_proof=transfer_canary,
                     worker_signature="",
                     orchestrator_signature="",
+                )
+
+                proof.orchestrator_signature = self._sign_proof(proof)
+
+                # Add to proof queues (so validators see them via /validators/proof-ids)
+                self.pending_proofs.append(proof)
+                self.epoch_proofs[self.current_epoch].append(proof)
+
+                # Publish proof to BeamCore immediately
+                await self._proof_agg.persist_bandwidth_proof(
+                    proof, self.current_epoch, self.db, self.subnet_core_client
+                )
+                logger.info(
+                    f"Proof published for task {task_id[:16]}...: "
+                    f"{bytes_transferred} bytes, {bandwidth_mbps:.1f} Mbps"
                 )
 
                 # Get worker object for quality multiplier calculation
@@ -1812,16 +1831,31 @@ class Orchestrator:
             logger.warning(f"Transfer {transfer_id[:16]}... missing gateway_url or destination_url")
             return
 
-        # Get available workers from SubnetCore
-        try:
-            workers_response = await self.subnet_core_client.list_workers(status="active")
-            workers = workers_response.get("workers", [])
-            if workers:
-                worker_ids = [w.get("worker_id", "?") for w in workers[:5]]
-                logger.info(f"Got {len(workers)} workers from SubnetCore: {worker_ids}...")
-        except Exception as e:
-            logger.error(f"Failed to list workers for transfer {transfer_id[:16]}...: {e}")
-            return
+        # Use cached worker pool (synced every 30s by worker_manager)
+        workers = [
+            {
+                "worker_id": w.worker_id,
+                "trust_score": w.trust_score,
+                "success_rate": w.success_rate,
+                "bandwidth_mbps": w.bandwidth_ema,
+                "load_factor": w.load_factor,
+            }
+            for w in self.workers.values()
+            if w.status != WorkerStatus.OFFLINE
+        ]
+
+        # Fall back to API if cache is empty (e.g. first transfer before initial sync)
+        if not workers and self.subnet_core_client:
+            try:
+                resp = await self.subnet_core_client.list_workers(status="active")
+                workers = resp.get("workers", [])
+                logger.info(f"Cache empty, fetched {len(workers)} workers from API")
+            except Exception as e:
+                logger.error(f"Failed to list workers for transfer {transfer_id[:16]}...: {e}")
+                return
+
+        if workers:
+            logger.info(f"Got {len(workers)} workers for transfer {transfer_id[:16]}...")
 
         if not workers:
             logger.warning(f"No active workers available for transfer {transfer_id[:16]}...")
@@ -1869,6 +1903,32 @@ class Orchestrator:
                 f"created={created} pushed={pushed}"
             )
 
+            # Cache task metadata so completion handler has real data
+            # Without this, task_result finds no task in memory → incomplete proofs
+            task_ids = result.get("task_ids", [])
+            cached_count = 0
+            tid_idx = 0
+            for assignment in assignments:
+                wid = assignment["worker_id"]
+                for chunk_idx in assignment.get("chunk_indices", []):
+                    tid = task_ids[tid_idx] if tid_idx < len(task_ids) else f"{transfer_id}-chunk{chunk_idx}"
+                    tid_idx += 1
+                    chunk_data = chunks[chunk_idx] if chunk_idx < len(chunks) else {}
+                    self.active_tasks[tid] = BandwidthTask(
+                        task_id=tid,
+                        worker_id=wid,
+                        chunk_size=chunk_data.get("size", chunk_size),
+                        chunk_hash=chunk_data.get("hash", ""),
+                        source_region="",
+                        dest_region="",
+                        created_at=time.time(),
+                        deadline_us=int((time.time() + self.settings.task_timeout_seconds) * 1_000_000),
+                    )
+                    cached_count += 1
+
+            if cached_count:
+                logger.info(f"Cached {cached_count} tasks for transfer {transfer_id[:16]}...")
+
             # Log any lost races (chunks already assigned to other orchestrators)
             if already_assigned > 0:
                 logger.info(
@@ -1912,8 +1972,11 @@ class Orchestrator:
             bandwidth_factor = min(2.0, bandwidth / 100.0)
             return trust * success * bandwidth_factor
 
-        # Sort workers by SLA score (best first)
+        # Sort workers by SLA score (best first), limit to top 33% (min 5)
+        # Only assign to reliable workers to maximize task completion rate
         sorted_workers = sorted(workers, key=worker_sla_score, reverse=True)
+        max_workers = max(5, len(sorted_workers) // 3)
+        sorted_workers = sorted_workers[:max_workers]
         worker_ids = [w["worker_id"] for w in sorted_workers]
 
         # Initialize assignments for each worker
