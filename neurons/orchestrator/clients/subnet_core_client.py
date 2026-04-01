@@ -553,7 +553,8 @@ class SubnetCoreClient:
 
         # Start HTTP fallback transfer polling. The loop is dormant while the
         # WebSocket is connected, and becomes active only when WS is unavailable.
-        safe_transfer_poll_interval = max(transfer_poll_interval, 11.0)
+        # Clamp to >=30s to avoid 429 rate-limits from BeamCore.
+        safe_transfer_poll_interval = max(transfer_poll_interval, 30.0)
         self._polling_tasks.append(
             asyncio.create_task(self._transfer_poll_loop(safe_transfer_poll_interval))
         )
@@ -580,7 +581,7 @@ class SubnetCoreClient:
             self._ws = None
 
         # Cancel tasks
-        for task in [self._ws_task, self._ws_heartbeat_task]:
+        for task in [self._ws_task, self._ws_heartbeat_task, getattr(self, '_transfer_poll_task', None)]:
             if task:
                 task.cancel()
                 try:
@@ -1050,19 +1051,21 @@ class SubnetCoreClient:
     # Legacy HTTP polling methods (kept for fallback/compatibility)
 
     async def _transfer_poll_loop(self, interval: float):
-        """Poll for pending transfers (fallback if WebSocket unavailable)."""
+        """Poll for pending transfers (runs alongside WebSocket as safety net).
+
+        Always polls — catches assignments that WebSocket may miss due to
+        reconnects, CloudFlare restarts, or race conditions.
+        """
         while self._running:
-            if not self._ws_connected:
-                try:
-                    transfers = await self.get_pending_transfers()
-                    for transfer in transfers:
-                        if self._transfer_handler:
-                            try:
-                                await self._transfer_handler(transfer)
-                            except Exception as e:
-                                logger.error(f"Error handling transfer: {e}")
-                except Exception as e:
-                    logger.warning(f"Transfer poll failed: {e}")
+            try:
+                transfers = await self.get_pending_transfers()
+                if transfers:
+                    logger.info(f"HTTP poll found {len(transfers)} pending transfer(s)")
+                for transfer in transfers:
+                    if self._transfer_handler:
+                        asyncio.create_task(self._safe_transfer_handler(transfer))
+            except Exception as e:
+                logger.warning(f"Transfer poll failed: {e}")
 
             await asyncio.sleep(interval)
 

@@ -102,3 +102,92 @@ See `.env.example` for all available variables.
 - **PyNaCl** for cryptographic signing of proofs
 - **Black** line-length is 100, **Ruff** rules: E, F, I, W (E501 ignored)
 - Validator imports beam library which reads UID config from env vars at import time - must call `_fetch_uid_config_sync()` before importing beam modules
+
+## BeamCore API Reference
+
+Dashboard: `https://beamcore.b1m.ai/dashboard/` (requires auth)
+API Docs: `https://beamcore.b1m.ai/redoc` | `https://beamcore.b1m.ai/docs`
+Auth: `X-Api-Key` header or hotkey signature (`X-Hotkey`, `X-Signature`, `X-Timestamp`, `X-Nonce`)
+
+### Key Endpoints
+
+#### Routing & Selection (how orchestrators get work)
+- `GET /routing/orchestrators` — List registered orchestrators with status, weight
+- `GET /routing/weight-distribution` — Per-orchestrator selection_probability
+- `GET /routing/select?region=` — Select orchestrator for transfer (weighted random by `combined_weight = sla_score × worker_factor`)
+- `POST /routing/plan` — Plan chunk distribution across orchestrators by weight
+- `GET /routing/worker-capacity` — Total worker capacity (used to determine chunk count)
+
+#### Orchestrator (our endpoints)
+- `GET /orchestrators/pending-transfers` — Poll for transfer assignments (HTTP fallback)
+- `POST /orchestrators/assignments` — Claim chunks for a transfer (race — 5s timeout)
+- `POST /orchestrators/tasks` / `POST /orchestrators/tasks/batch` — Create tasks
+- `POST /orchestrators/tasks/acknowledge` — Acknowledge completions, create PoB
+- `POST /orchestrators/tasks/reassign` — Reassign stale task to new worker
+- `GET /orchestrators/slots/status` — Slot system status (public)
+- `GET /orchestrators/workers` — List workers in our pool
+
+#### Worker Affiliation (CRITICAL)
+- `POST /workers/affiliate` — Affiliate worker with orchestrator. Sign `"{worker_id}:{orchestrator_hotkey}"`
+- `POST /workers/affiliations` — Same, alternate endpoint
+- `POST /sla/orchestrators/{id}/workers/join` — Worker joins orchestrator with SLA commitment
+- `DELETE /workers/{worker_id}/affiliate/{orchestrator_hotkey}` — Remove affiliation
+- `GET /workers/{worker_id}/affiliations` — Check worker's affiliations
+
+#### Worker
+- `POST /workers/register` — Register worker (hotkey + IP + signature)
+- `POST /workers/heartbeat` — Worker heartbeat
+- `GET /workers/tasks/pending` — Poll for pending tasks
+- `POST /workers/tasks/accept` — Accept a task
+- `POST /workers/tasks/complete` — Report completion (with chunk_hash, bandwidth)
+
+#### Proof of Bandwidth
+- `GET /pob/epoch/{epoch}/summaries` — Epoch summaries (validators use this for weights)
+- `GET /pob/latest-epoch` — Latest epoch with data
+- `GET /pob/stats/{hotkey}` — Orchestrator PoB stats
+
+#### Dashboard API (admin/monitoring)
+- `GET /dashboard/api/traffic-allocation` — How BeamCore distributes traffic
+- `GET /dashboard/api/orchestrators` — All orchestrators with status
+- `GET /dashboard/api/orchestrators/{hotkey}/pool` — Orchestrator's worker pool
+- `GET /dashboard/api/orchestrator-stats?hotkey=` — Orchestrator payment/activity stats
+- `GET /dashboard/api/weights` — Current weight distribution with formula components
+- `GET /dashboard/api/mass-affiliation` — Worker affiliation management
+
+### Traffic Allocation Formula
+
+BeamCore distributes transfers using:
+```
+combined_weight = sla_score × worker_factor
+worker_factor = log2(active_workers + 1) + 1  (approx)
+```
+
+Key factors:
+- `active_workers` — Workers with recent heartbeat affiliated with your orchestrator
+- `sla_score` — Currently 0.5 for all orchestrators (baseline)
+- `compliance_score` — 1.0 for compliant orchestrators
+- Each orchestrator gets `traffic_pct = combined_weight / sum(all_weights) * 100`
+
+### Validator Weight Formula
+
+```
+raw_weight = exposure × quality × confidence × penalty
+```
+
+- **Exposure** = 70% bytes_share + 30% proofs_share (relative to all orchestrators)
+- **Quality** = 40% bandwidth + 25% compliance + 20% verification + 15% spot_check. Trust gate: <0.5 compliance or verification → 0.5x penalty
+- **Confidence** = sqrt ramp: needs 10 proofs + 1GB bytes for full confidence
+- **Penalty** = fraud multiplier (default 1.0)
+
+Validators fetch `/pob/epoch/{epoch}/summaries` from BeamCore. Only orchestrators in summaries get weight. Zero proofs = zero confidence = zero weight.
+
+### Worker-Orchestrator Relationship
+
+Workers register with BeamCore globally. They must be **affiliated** with an orchestrator to count toward that orchestrator's `active_workers` and receive tasks from it. Without affiliation, workers are in a global pool and may be assigned to other orchestrators.
+
+### Current Deployment (UID 115)
+
+- Orchestrator: `beam` (pm2), hotkey `dream-001`, UID 115, slot 30
+- Workers: `beam-w5` through `beam-w14` (pm2), hotkeys `dream-005` to `dream-014`
+- Server: 95.217.67.193 (Hetzner Finland), registered as region US
+- Known issue: BeamCore alpha stake cache shows 0.0 despite 31.60 on-chain

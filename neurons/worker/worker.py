@@ -186,6 +186,7 @@ async def register_worker(client: httpx.AsyncClient, state: WorkerState) -> Dict
         "ip": ip,
         "port": port,
         "claimed_bandwidth_mbps": 100,
+        "region": os.environ.get("BEAM_WORKER_REGION", "auto"),
         "coldkey": wallet.coldkeypub.ss58_address if wallet.coldkeypub else hotkey,
         "payment_pubkey": payment_pubkey,
         "signature": signature,
@@ -224,6 +225,48 @@ async def register_worker(client: httpx.AsyncClient, state: WorkerState) -> Dict
             if attempt == 2:
                 raise Exception(f"Connection error to {state.api_url} after 3 attempts")
             await asyncio.sleep(2)
+
+
+async def affiliate_worker(
+    client: httpx.AsyncClient,
+    state: WorkerState,
+    orchestrator_hotkeys: List[str],
+) -> None:
+    """Affiliate this worker with one or more orchestrators.
+
+    Signs "{worker_id}:{orchestrator_hotkey}" for each orchestrator.
+
+    Auth priority: BEAM_ORCHESTRATOR_API_KEY env > worker's own api_key.
+    """
+    api_key = os.environ.get("BEAM_ORCHESTRATOR_API_KEY") or state.api_key
+    if not api_key:
+        print("[Worker] No API key available for affiliation, skipping")
+        return
+
+    headers = {"X-Api-Key": api_key}
+    worker_hotkey = state.wallet.hotkey.ss58_address
+
+    for orch_hotkey in orchestrator_hotkeys:
+        try:
+            signature = sign_message(state.wallet, f"{state.worker_id}:{orch_hotkey}")
+            response = await client.post(
+                f"{state.api_url}/workers/affiliations",
+                json={
+                    "worker_id": state.worker_id,
+                    "orchestrator_hotkey": orch_hotkey,
+                    "worker_hotkey": worker_hotkey,
+                    "capacity_percentage": 100,
+                    "signature": signature,
+                },
+                headers=headers,
+                timeout=15.0,
+            )
+            if response.status_code == 200:
+                print(f"[Worker] Affiliated with orchestrator {orch_hotkey[:16]}...")
+            else:
+                print(f"[Worker] Affiliation failed for {orch_hotkey[:16]}...: HTTP {response.status_code} {response.text[:200]}")
+        except Exception as e:
+            print(f"[Worker] Affiliation error for {orch_hotkey[:16]}...: {e}")
 
 
 async def send_heartbeat(client: httpx.AsyncClient, state: WorkerState) -> bool:
@@ -1119,27 +1162,28 @@ shutdown_event = asyncio.Event()
 
 
 async def run_worker(state: WorkerState):
-    """Run the worker."""
-    wallet = state.wallet
-    hotkey = wallet.hotkey.ss58_address
+    """Run the worker: register, affiliate, then poll for tasks."""
+    hotkey = state.wallet.hotkey.ss58_address
 
-    # Create HTTP client
     state.http_client = httpx.AsyncClient(
         timeout=httpx.Timeout(connect=10.0, read=60.0, write=60.0, pool=5.0),
-        limits=httpx.Limits(max_connections=20, max_keepalive_connections=10)
+        limits=httpx.Limits(max_connections=20, max_keepalive_connections=10),
     )
 
     try:
-        async with httpx.AsyncClient() as client:
-            # Register with SubnetCore
-            print(f"[Worker] Registering with SubnetCore...")
-            print(f"[Worker] Hotkey: {hotkey}")
-            print(f"[Worker] API URL: {state.api_url}")
+        # Register with BeamCore
+        print(f"[Worker] Registering: hotkey={hotkey}, url={state.api_url}")
+        result = await register_worker(state.http_client, state)
+        state.worker_id = result.get("worker_id")
+        state.api_key = result.get("api_key")
+        print(f"[Worker] Registered: {state.worker_id}")
 
-            result = await register_worker(client, state)
-            state.worker_id = result.get("worker_id")
-            state.api_key = result.get("api_key")
-            print(f"[Worker] Registered: {state.worker_id}")
+        # Auto-affiliate with orchestrators (env: comma-separated hotkeys)
+        orch_hotkeys_env = os.environ.get("BEAM_ORCHESTRATOR_HOTKEYS", "")
+        if orch_hotkeys_env:
+            orch_list = [h for h in orch_hotkeys_env.split(",") if h.strip()]
+            print(f"[Worker] Affiliating with {len(orch_list)} orchestrator(s)...")
+            await affiliate_worker(state.http_client, state, orch_list)
 
         # Start connection loop
         if CONNECTION_MODE == "http":
@@ -1160,7 +1204,7 @@ async def run_worker(state: WorkerState):
             await polling_loop(state)
 
     except asyncio.CancelledError:
-        print(f"[Worker] Cancelled")
+        print("[Worker] Cancelled")
     except Exception as e:
         print(f"[Worker] Error: {e}")
         raise
@@ -1172,7 +1216,7 @@ async def run_worker(state: WorkerState):
             await state.http_client.aclose()
             state.http_client = None
 
-    print(f"[Worker] Stopped")
+    print("[Worker] Stopped")
 
 
 def get_config():
@@ -1180,11 +1224,11 @@ def get_config():
     parser = argparse.ArgumentParser(description="Beam Network Worker")
 
     # Bittensor wallet arguments
-    bt.wallet.add_args(parser)
-    bt.subtensor.add_args(parser)
+    bt.Wallet.add_args(parser)
+    bt.Subtensor.add_args(parser)
 
     # Parse arguments
-    config = bt.config(parser)
+    config = bt.Config(parser)
     return config
 
 
@@ -1197,7 +1241,7 @@ async def main():
     config = get_config()
 
     # Load bittensor wallet
-    wallet = bt.wallet(config=config)
+    wallet = bt.Wallet(config=config)
     print(f"Wallet name: {wallet.name}")
     print(f"Hotkey name: {wallet.hotkey_str}")
 
