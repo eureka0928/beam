@@ -226,7 +226,10 @@ class SubnetCoreClient:
     async def _get_client(self) -> httpx.AsyncClient:
         """Get or create HTTP client."""
         if self._client is None:
-            self._client = httpx.AsyncClient(timeout=self.timeout)
+            self._client = httpx.AsyncClient(
+                timeout=self.timeout,
+                follow_redirects=True,  # Handle any network-level redirects
+            )
         return self._client
 
     async def _request(
