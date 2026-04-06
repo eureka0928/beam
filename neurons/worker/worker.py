@@ -73,7 +73,7 @@ CONNECTION_MODE = os.environ.get("CONNECTION_MODE", "auto")
 
 # Intervals
 HEARTBEAT_INTERVAL = 30  # seconds
-TASK_POLL_INTERVAL = 5   # seconds
+TASK_POLL_INTERVAL = 30  # seconds (keep low to avoid rate limits)
 
 # WebSocket settings
 WS_RECONNECT_MIN_DELAY = 12.0   # must exceed server's 10s cooldown
@@ -261,22 +261,33 @@ async def affiliate_worker(
 
 
 async def send_heartbeat(client: httpx.AsyncClient, state: WorkerState) -> bool:
-    """Send worker heartbeat to BeamCore."""
+    """Send worker heartbeat to BeamCore.
+
+    Signature format: "{worker_id}:{hotkey}:{timestamp}"
+    """
     try:
-        headers = {"X-Api-Key": state.api_key} if state.api_key else {}
+        # Don't send API key with heartbeat - it counts against the orchestrator's rate limit
+        # Signature-based auth is sufficient for heartbeats
+        headers = {}
+        hotkey = state.wallet.hotkey.ss58_address
+        timestamp = int(time.time())
+        signature = sign_message(state.wallet, f"{state.worker_id}:{hotkey}:{timestamp}")
         response = await client.post(
             f"{state.api_url}/workers/heartbeat",
             json={
                 "worker_id": state.worker_id,
-                "hotkey": state.wallet.hotkey.ss58_address,
+                "hotkey": hotkey,
                 "bandwidth_mbps": 100.0,
                 "active_tasks": state.active_tasks,
                 "bytes_relayed": state.bytes_relayed,
+                "signature": signature,
+                "timestamp": timestamp,
             },
             headers=headers,
             timeout=10.0,
         )
         if response.status_code != 200:
+            print(f"[Worker] Heartbeat failed: HTTP {response.status_code}")
             return False
         data = response.json()
         return data.get("success", False)
@@ -288,7 +299,8 @@ async def send_heartbeat(client: httpx.AsyncClient, state: WorkerState) -> bool:
 async def poll_worker_tasks(client: httpx.AsyncClient, state: WorkerState) -> List[Dict[str, Any]]:
     """Poll for pending tasks assigned to this worker."""
     try:
-        headers = {"X-Api-Key": state.api_key} if state.api_key else {}
+        # Don't send API key - uses orchestrator's rate limit
+        headers = {}
         response = await client.get(
             f"{state.api_url}/workers/tasks/pending",
             params={"worker_id": state.worker_id, "max_tasks": 3},
@@ -1126,8 +1138,8 @@ async def run_worker(state: WorkerState):
         print(f"[Worker] Registering: hotkey={hotkey}, url={state.api_url}")
         result = await register_worker(state.http_client, state)
         state.worker_id = result.get("worker_id")
-        state.api_key = result.get("api_key")
-        print(f"[Worker] Registered: {state.worker_id}")
+        state.api_key = result.get("api_key") or os.environ.get("BEAM_ORCHESTRATOR_API_KEY")
+        print(f"[Worker] Registered: {state.worker_id} (api_key={'yes' if state.api_key else 'no'})")
 
         # Auto-affiliate with orchestrators (env: comma-separated hotkeys)
         orch_hotkeys_env = os.environ.get("BEAM_ORCHESTRATOR_HOTKEYS", "")
