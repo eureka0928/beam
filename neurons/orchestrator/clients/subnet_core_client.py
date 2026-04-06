@@ -1056,6 +1056,7 @@ class SubnetCoreClient:
         Always polls — catches assignments that WebSocket may miss due to
         reconnects, CloudFlare restarts, or race conditions.
         """
+        backoff = interval
         while self._running:
             try:
                 transfers = await self.get_pending_transfers()
@@ -1064,10 +1065,15 @@ class SubnetCoreClient:
                 for transfer in transfers:
                     if self._transfer_handler:
                         asyncio.create_task(self._safe_transfer_handler(transfer))
+                backoff = interval  # Reset on success
             except Exception as e:
-                logger.warning(f"Transfer poll failed: {e}")
+                if "429" in str(e):
+                    backoff = min(backoff * 2, 600)  # Double backoff up to 10 min
+                    logger.warning(f"Transfer poll rate limited, backing off to {backoff}s")
+                else:
+                    logger.warning(f"Transfer poll failed: {e}")
 
-            await asyncio.sleep(interval)
+            await asyncio.sleep(backoff)
 
     async def _results_poll_loop(self, interval: float):
         """Poll for pending task results (fallback if WebSocket unavailable)."""
@@ -1216,6 +1222,8 @@ class SubnetCoreClient:
 
         except httpx.HTTPStatusError as e:
             logger.error(f"HTTP error getting pending transfers: {e.response.status_code}")
+            if e.response.status_code == 429:
+                raise  # Propagate so poll loop can backoff
             return []
         except Exception as e:
             logger.error(f"Error getting pending transfers: {type(e).__name__}: {repr(e)}")

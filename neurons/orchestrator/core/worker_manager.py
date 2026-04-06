@@ -556,11 +556,17 @@ class WorkerManager:
         await asyncio.sleep(5)  # Wait for SubnetCore client to initialize
         await self.sync_workers_from_subnetcore()
 
+        backoff = interval_seconds
         while running_flag():
             try:
-                await asyncio.sleep(interval_seconds)
+                await asyncio.sleep(backoff)
                 await self.sync_workers_from_subnetcore()
+                backoff = interval_seconds  # Reset on success
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                logger.error(f"Error in worker sync loop: {e}")
+                if "429" in str(e):
+                    backoff = min(backoff * 2, 600)  # Double backoff up to 10 min
+                    logger.warning(f"Rate limited, backing off to {backoff}s")
+                else:
+                    logger.error(f"Error in worker sync loop: {e}")
