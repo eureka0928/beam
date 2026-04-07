@@ -244,6 +244,45 @@ async def _handle_transfer_assigned(
 BEAMCORE_REGISTER_LOG = "[BEAMCORE_REGISTER]"
 
 
+async def _register_with_core_api(settings, hotkey: str, uid: int = None, api_key: str = None) -> bool:
+    """Register this orchestrator with BeamCore via HTTP (fallback for WebSocket)."""
+    url = f"{settings.subnet_core_url}/orchestrators/register"
+    local_ip = settings.external_ip or _get_local_ip()
+    orch_url = f"http://{local_ip}:{settings.api_port}"
+
+    payload = {
+        "hotkey": hotkey,
+        "url": orch_url,
+        "ip": local_ip,
+        "port": settings.api_port,
+        "region": settings.region,
+        "max_workers": settings.max_workers,
+        "uid": uid,
+        "fee_percentage": settings.fee_percentage,
+        "signature": "local",
+    }
+
+    headers = {"X-Hotkey": hotkey}
+    if api_key:
+        headers["X-Api-Key"] = api_key
+
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            resp = await client.post(url, json=payload, headers=headers)
+            if resp.status_code == 200:
+                data = resp.json()
+                logging.getLogger(__name__).info(f"HTTP registration with BeamCore: {data}")
+                return True
+            else:
+                logging.getLogger(__name__).warning(
+                    f"HTTP registration failed: {resp.status_code} - {resp.text[:200]}"
+                )
+                return False
+    except Exception as e:
+        logging.getLogger(__name__).warning(f"HTTP registration error: {e}")
+        return False
+
+
 async def _connect_and_register_ws(settings, wallet, get_worker_count, get_balance_info=None, get_uid=None):
     """
     Connect to BeamCore via WebSocket and register/send heartbeats.
@@ -697,9 +736,16 @@ async def lifespan(app: FastAPI):
         """Get UID from metagraph detection."""
         return orchestrator.our_uid
 
-    # Registration is handled by SubnetCoreClient via WebSocket (set_registration_config)
-    # Do NOT also call _register_with_core_api() — dual registration confuses BeamCore
-    # about which connection should receive transfer assignments
+    # WebSocket registration is primary (via SubnetCoreClient)
+    # Also try HTTP registration as fallback to ensure we get a slot
+    api_key = None
+    if orchestrator.subnet_core_client:
+        api_key = orchestrator.subnet_core_client._api_key
+    registered = await _register_with_core_api(settings, orchestrator.hotkey, orchestrator.our_uid, api_key)
+    if registered:
+        logger.info("HTTP registration succeeded — slot should be assigned")
+    else:
+        logger.warning("HTTP registration failed — relying on WebSocket registration")
     logger.info("Registration and WebSocket handled by SubnetCoreClient")
 
     # Signal readiness to receive transfers (controlled by READY env var / config)

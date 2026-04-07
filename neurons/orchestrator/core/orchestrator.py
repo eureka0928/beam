@@ -1845,6 +1845,7 @@ class Orchestrator:
         SubnetCore then notifies workers of their task assignments.
         """
         _t0 = time.monotonic()
+        _source = transfer.pop("_source", "unknown")
 
         transfer_id = transfer.get("transfer_id", "")
         gateway_url = transfer.get("gateway_url", "")
@@ -1866,7 +1867,7 @@ class Orchestrator:
         assigned_chunk_count = chunk_end - chunk_start + 1
 
         logger.info(
-            f"Transfer registered: {transfer_id[:16]}... "
+            f"[{_source}] Transfer registered: {transfer_id[:16]}... "
             f"chunks={assigned_chunk_count} (range {chunk_start}-{chunk_end}) "
             f"total={total_chunks} gateway={gateway_url[:30] if gateway_url else 'none'}... "
             f"s3_transfer={is_s3_transfer}"
@@ -1901,8 +1902,9 @@ class Orchestrator:
                 logger.error(f"Failed to list workers for transfer {transfer_id[:16]}...: {e}")
                 return
 
+        _t_workers = (time.monotonic() - _t0) * 1000
         if workers:
-            logger.info(f"Got {len(workers)} workers for transfer {transfer_id[:16]}...")
+            logger.info(f"Got {len(workers)} workers for transfer {transfer_id[:16]}... ({_t_workers:.0f}ms)")
 
         if not workers:
             logger.warning(f"No active workers available for transfer {transfer_id[:16]}...")
@@ -1916,9 +1918,10 @@ class Orchestrator:
             chunk_end=chunk_end,
         )
 
+        _t_assign = (time.monotonic() - _t0) * 1000
         logger.info(
             f"Assigned {assigned_chunk_count} chunks (range {chunk_start}-{chunk_end}) "
-            f"to {len(assignments)} workers for transfer {transfer_id[:16]}..."
+            f"to {len(assignments)} workers for transfer {transfer_id[:16]}... ({_t_assign:.0f}ms)"
         )
 
         # Use total_size from message, or calculate from chunks
@@ -1946,9 +1949,11 @@ class Orchestrator:
             already_assigned = result.get('already_assigned_count', 0)
 
             _elapsed_ms = (time.monotonic() - _t0) * 1000
+            _t_post = _elapsed_ms - _t_assign  # Time spent on HTTP POST alone
             logger.info(
-                f"Posted assignments for transfer {transfer_id[:16]}...: "
-                f"created={created} pushed={pushed} elapsed={_elapsed_ms:.0f}ms"
+                f"[{_source}] Posted assignments for transfer {transfer_id[:16]}...: "
+                f"created={created} pushed={pushed} elapsed={_elapsed_ms:.0f}ms "
+                f"(workers={_t_workers:.0f}ms assign={_t_assign - _t_workers:.0f}ms post={_t_post:.0f}ms)"
             )
 
             # Cache task metadata so completion handler has real data
