@@ -562,6 +562,10 @@ class SubnetCoreClient:
         # Start heartbeat loop (still uses HTTP)
         self._ws_heartbeat_task = asyncio.create_task(self._heartbeat_loop(heartbeat_interval))
 
+        # Keep HTTP connection warm so assignment POSTs don't need TCP+TLS handshake
+        self._warmup_task = asyncio.create_task(self._connection_warmup_loop())
+
+
         logger.info(
             f"Started WebSocket connection to {self._get_ws_url()}, "
             f"heartbeat={heartbeat_interval}s, fallback_transfer_poll={safe_transfer_poll_interval}s"
@@ -581,7 +585,7 @@ class SubnetCoreClient:
             self._ws = None
 
         # Cancel tasks
-        for task in [self._ws_task, self._ws_heartbeat_task, getattr(self, '_transfer_poll_task', None)]:
+        for task in [self._ws_task, self._ws_heartbeat_task, getattr(self, '_transfer_poll_task', None), getattr(self, '_warmup_task', None)]:
             if task:
                 task.cancel()
                 try:
@@ -598,9 +602,14 @@ class SubnetCoreClient:
         reconnect_delay = self._reconnect_delay
 
         while self._running:
+            _ws_connected_at = time.monotonic()
+            was_keepalive_timeout = False
             try:
                 await self._connect_websocket()
                 reconnect_delay = self._reconnect_delay  # Reset on successful connection
+                # Trigger immediate HTTP poll to catch transfers missed during disconnect
+                if hasattr(self, "_poll_now") and self._poll_now is not None:
+                    self._poll_now.set()
                 await self._ws_message_loop()
             except ConnectionClosed as e:
                 logger.warning(f"WebSocket closed: {e}")
@@ -615,6 +624,9 @@ class SubnetCoreClient:
             self._ws = None
 
             if self._running:
+                # Fast reconnect after keepalive timeout (connection was recently alive)
+                if was_keepalive_timeout:
+                    reconnect_delay = self._reconnect_delay  # Reset to 5s
                 logger.info(f"Reconnecting WebSocket in {reconnect_delay}s...")
                 await asyncio.sleep(reconnect_delay)
                 reconnect_delay = min(reconnect_delay * 1.5, self._max_reconnect_delay)
@@ -670,8 +682,8 @@ class SubnetCoreClient:
         self._ws = await websockets.connect(
             url,
             additional_headers=headers,
-            ping_interval=30,
-            ping_timeout=10,
+            ping_interval=20,
+            ping_timeout=15,
         )
         self._ws_connected = True
         self._registered = False  # Reset on new connection
@@ -720,17 +732,19 @@ class SubnetCoreClient:
         elif msg_type == "transfer_assignment":
             # New transfer to process (single assignment)
             # Fire-and-forget: don't block WS loop — we need to claim chunks ASAP
-            logger.info(f"Received transfer assignment: {data.get('transfer_id')}")
+            logger.info(f"Received transfer assignment via WS: {data.get('transfer_id')}")
             if self._transfer_handler:
+                data["_source"] = "ws"
                 asyncio.create_task(self._safe_transfer_handler(data))
 
         elif msg_type == "transfer_assignments":
             # Batch of transfer assignments (multiple src×dest combos)
             # Process ALL concurrently to maximize chunk-claim speed
             assignments = data.get("assignments", [])
-            logger.info(f"Received {len(assignments)} batched transfer assignments")
+            logger.info(f"Received {len(assignments)} batched transfer assignments via WS")
             if self._transfer_handler:
                 for assignment in assignments:
+                    assignment["_source"] = "ws"
                     asyncio.create_task(self._safe_transfer_handler(assignment))
 
         elif msg_type == "task_result":
@@ -1048,22 +1062,55 @@ class SubnetCoreClient:
 
             await asyncio.sleep(interval)
 
+    async def _connection_warmup_loop(self):
+        """Periodically ping BeamCore to keep HTTP connection pool warm.
+
+        Without this, idle connections expire (even with 120s keepalive) and
+        the next assignment POST incurs a fresh TCP+TLS handshake (~50-100ms).
+        """
+        while self._running:
+            await asyncio.sleep(60)
+            try:
+                client = await self._get_client()
+                # Lightweight request just to keep the connection alive
+                await client.get(
+                    f"{self.base_url}/orchestrators/slots/status",
+                    timeout=5.0,
+                )
+                logger.debug("HTTP connection warmup ping sent")
+            except Exception:
+                pass  # Non-critical — next real request will reconnect
+
     # Legacy HTTP polling methods (kept for fallback/compatibility)
 
     async def _transfer_poll_loop(self, interval: float):
-        """Poll for pending transfers (runs alongside WebSocket as safety net).
+        """Poll for pending transfers as fallback when WebSocket is disconnected.
 
-        Always polls — catches assignments that WebSocket may miss due to
-        reconnects, CloudFlare restarts, or race conditions.
+        Skips polling while WebSocket is connected to save rate limit budget.
+        Polls immediately after WS reconnects (via _poll_now event) to catch
+        any transfers missed during the disconnect window.
         """
+        self._poll_now = asyncio.Event()
         backoff = interval
         while self._running:
+            # Skip polling while WebSocket is delivering transfers
+            if self._ws_connected:
+                # Wait for either the interval or a _poll_now signal (e.g. after WS reconnect)
+                try:
+                    await asyncio.wait_for(self._poll_now.wait(), timeout=interval)
+                    self._poll_now.clear()
+                except asyncio.TimeoutError:
+                    pass
+                if self._ws_connected:
+                    continue  # WS still up — no need to poll
+
             try:
                 transfers = await self.get_pending_transfers()
                 if transfers:
-                    logger.info(f"HTTP poll found {len(transfers)} pending transfer(s)")
+                    logger.info(f"HTTP poll found {len(transfers)} pending transfer(s) (WS down)")
                 for transfer in transfers:
                     if self._transfer_handler:
+                        transfer["_source"] = "poll"
                         asyncio.create_task(self._safe_transfer_handler(transfer))
                 backoff = interval  # Reset on success
             except Exception as e:
@@ -1423,6 +1470,11 @@ class SubnetCoreClient:
         if self._client is None:
             self._client = httpx.AsyncClient(
                 timeout=self.timeout,
+                limits=httpx.Limits(
+                    max_connections=20,
+                    max_keepalive_connections=5,
+                    keepalive_expiry=120,  # 2 min keepalive (default 5s is too short)
+                ),
                 event_hooks={
                     "request": [self._inject_auth_headers],
                 },
