@@ -107,14 +107,16 @@ class RewardManager:
         db,
         subnet_core_client,
         fee_percentage: float = 12.0,
-        use_alpha: bool = False,
         netuid: int = 105,
-        alpha_per_chunk: float = 1.0,
+        alpha_per_chunk: float = 100.0,
     ) -> Optional[float]:
         """
-        Calculate, transfer, and record immediate payment for a completed task.
+        Calculate, transfer, and record immediate ALPHA payment for a completed task.
 
-        Returns the reward amount in TAO, or None if payment failed.
+        ALPHA payments are mandatory - workers are paid in ALPHA tokens with on-chain
+        memo for validator verification (Proof of Payment).
+
+        Returns the reward amount in ALPHA, or None if payment failed.
         """
         # Skip tasks with no bytes relayed — no work done, nothing to pay
         if not proof.bytes_relayed or proof.bytes_relayed <= 0:
@@ -130,9 +132,9 @@ class RewardManager:
             )
             return None
 
-        # ALPHA payment: Validate transfer before payment
+        # ALPHA payment: Validate transfer before payment (mandatory)
         transfer_id = None
-        if use_alpha and SUBNET_CORE_CLIENT_AVAILABLE and subnet_core_client:
+        if SUBNET_CORE_CLIENT_AVAILABLE and subnet_core_client:
             try:
                 validation = await subnet_core_client.validate_transfer_for_payment(proof.task_id)
                 if not validation.get("valid"):
@@ -145,8 +147,12 @@ class RewardManager:
                 logger.debug(f"Transfer validated for ALPHA payment: {transfer_id}")
             except Exception as e:
                 logger.warning(f"Transfer validation failed for task {proof.task_id[:16]}...: {e}")
-                # Fall through to TAO payment if validation fails
-                use_alpha = False
+                # Queue for retry - ALPHA payments are mandatory
+                self._queue_failed_payment(worker, proof, alpha_per_chunk)
+                return None
+        else:
+            logger.warning(f"Cannot pay ALPHA: SubnetCore client not available for task {proof.task_id[:16]}...")
+            return None
 
         # Extract worker info from proof (always available, even when worker object is None)
         worker_id = proof.worker_id
@@ -270,9 +276,9 @@ class RewardManager:
         alpha_amount_rao = 0
 
         # =====================================================================
-        # ALPHA Payment Path: transfer_stake with on-chain memo
+        # ALPHA Payment (Mandatory): transfer_stake with on-chain memo
         # =====================================================================
-        if use_alpha and transfer_id and wallet and subtensor:
+        if transfer_id and wallet and subtensor:
             try:
                 # Resolve worker's coldkey (required for transfer_stake)
                 worker_coldkey = await self._resolve_worker_coldkey(worker_hotkey, subtensor, netuid)
@@ -324,58 +330,16 @@ class RewardManager:
                 logger.error(f"Error in ALPHA payment: {e}", exc_info=True)
                 self._queue_failed_payment(worker, proof, reward)
 
-        # =====================================================================
-        # TAO Payment Path: standard transfer (fallback when use_alpha=False)
-        # =====================================================================
-        elif wallet and subtensor and reward > 0:
-            try:
-                # Convert reward to Balance object (required by new bittensor API)
-                amount = Balance.from_tao(reward) if Balance else reward
-                response = subtensor.transfer(
-                    wallet=wallet,
-                    destination_ss58=payment_dest,
-                    amount=amount,
-                    wait_for_inclusion=True,
-                    wait_for_finalization=False,
-                )
-                # Handle both old bool return and new ExtrinsicResponse
-                success = response.is_success if hasattr(response, 'is_success') else bool(response)
-                if success:
-                    transfer_success = True
-                    # Extract real blockchain tx hash from ExtrinsicResponse
-                    # SDK v10+: tx hash is in response.extrinsic_receipt.extrinsic_hash
-                    # Also extract block_hash for on-chain verification
-                    tx_hash = None
-                    block_hash = None
-                    if hasattr(response, 'extrinsic_receipt') and response.extrinsic_receipt:
-                        receipt = response.extrinsic_receipt
-                        if hasattr(receipt, 'extrinsic_hash') and receipt.extrinsic_hash:
-                            tx_hash = str(receipt.extrinsic_hash)
-                        if hasattr(receipt, 'block_hash') and receipt.block_hash:
-                            block_hash = str(receipt.block_hash)
-                    if not tx_hash:
-                        # Fallback to synthetic hash if real hash not available
-                        tx_hash = f"transfer:{hotkey[:8]}:{payment_dest[:8]}:{int(time.time())}"
-                        logger.warning(f"Could not extract real tx hash from response: {type(response)}")
-                    elif block_hash:
-                        # Combine extrinsic_hash:block_hash for validator verification
-                        tx_hash = f"{tx_hash}:{block_hash}"
-                    logger.info(
-                        f"On-chain transfer SUCCESS: {reward:.9f} TAO to {payment_dest[:16]}... tx={tx_hash[:24]}..."
-                    )
-                else:
-                    logger.error(
-                        f"On-chain transfer FAILED: {reward:.9f} TAO to {payment_dest[:16]}..."
-                    )
-                    self._queue_failed_payment(worker, proof, reward)
-            except Exception as e:
-                logger.error(f"Error transferring TAO to worker: {e}")
-                self._queue_failed_payment(worker, proof, reward)
+        # Note: TAO fallback removed - ALPHA payments are mandatory
         else:
+            if not transfer_id:
+                logger.warning(f"Cannot pay ALPHA: no transfer_id for task {proof.task_id[:16]}...")
             if not wallet:
-                logger.warning("No wallet available for on-chain transfer")
+                logger.warning("Cannot pay ALPHA: no wallet available")
             if not subtensor:
-                logger.warning("No subtensor connection for on-chain transfer")
+                logger.warning("Cannot pay ALPHA: no subtensor connection")
+            self._queue_failed_payment(worker, proof, alpha_per_chunk)
+            return None
 
         self.last_emission_check = current_emission
 
@@ -438,18 +402,11 @@ class RewardManager:
                     logger.warning(f"Failed to immediately acknowledge task {proof.task_id[:16]}...: {e}")
 
         status = "PAID" if transfer_success else "QUEUED FOR RETRY"
-        if use_alpha and transfer_success:
-            logger.info(
-                f"Immediate payment [{status}]: Worker {worker_id[:8]} ({worker_hotkey[:12]}...) "
-                f"earned {alpha_per_chunk} ALPHA for {proof.bytes_relayed:,} bytes "
-                f"(transfer={transfer_id})"
-            )
-        else:
-            logger.info(
-                f"Immediate payment [{status}]: Worker {worker_id[:8]} ({worker_hotkey[:12]}...) "
-                f"earned {reward:.9f} TAO for {proof.bytes_relayed:,} bytes "
-                f"(quality={quality_multiplier:.2f})"
-            )
+        logger.info(
+            f"Immediate ALPHA payment [{status}]: Worker {worker_id[:8]} ({worker_hotkey[:12]}...) "
+            f"earned {alpha_per_chunk} ALPHA for {proof.bytes_relayed:,} bytes "
+            f"(transfer={transfer_id})"
+        )
 
         return reward if transfer_success else None
 

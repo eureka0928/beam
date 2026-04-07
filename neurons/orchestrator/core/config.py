@@ -78,6 +78,12 @@ class OrchestratorSettings(BaseSettings):
     fee_percentage: float = Field(default=0.0, env="FEE_PERCENTAGE")  # 0-100%
 
     # ==========================================================================
+    # ALPHA Payment Settings (mandatory for worker payments)
+    # ==========================================================================
+    # Amount of ALPHA to pay per completed task/chunk
+    alpha_per_chunk: float = Field(default=100.0, env="ALPHA_PER_CHUNK")
+
+    # ==========================================================================
     # Worker Management
     # ==========================================================================
     max_workers: int = Field(default=10000, env="MAX_WORKERS")

@@ -845,12 +845,14 @@ class Orchestrator:
         # Persist proof
         await self._proof_agg.persist_bandwidth_proof(proof, self.current_epoch, self.db, self.subnet_core_client)
 
-        # Pay worker immediately
+        # Pay worker immediately (ALPHA payment - mandatory)
         payment = await self._reward_mgr.pay_worker_immediately(
             worker, proof, self.current_epoch, self.get_our_emission,
             self.total_bytes_relayed, self.wallet, self.subtensor,
             self.hotkey or "", self.db, self.subnet_core_client,
             fee_percentage=self.settings.fee_percentage,
+            netuid=self.settings.netuid,
+            alpha_per_chunk=self.settings.alpha_per_chunk,
         )
         self._track_payment_result(payment)
 
@@ -978,11 +980,14 @@ class Orchestrator:
 
         await self._proof_agg.persist_bandwidth_proof(proof, self.current_epoch, self.db, self.subnet_core_client)
 
+        # Pay worker immediately (ALPHA payment - mandatory)
         payment = await self._reward_mgr.pay_worker_immediately(
             worker, proof, self.current_epoch, self.get_our_emission,
             self.total_bytes_relayed, self.wallet, self.subtensor,
             self.hotkey or "", self.db, self.subnet_core_client,
             fee_percentage=self.settings.fee_percentage,
+            netuid=self.settings.netuid,
+            alpha_per_chunk=self.settings.alpha_per_chunk,
         )
         self._track_payment_result(payment)
 
@@ -1680,13 +1685,15 @@ class Orchestrator:
                 # Get worker object for quality multiplier calculation
                 worker = self.workers.get(worker_id)
 
-                # Trigger payment
+                # Trigger ALPHA payment (mandatory)
                 try:
                     payment = await self._reward_mgr.pay_worker_immediately(
                         worker, proof, self.current_epoch, self.get_our_emission,
                         self.total_bytes_relayed, self.wallet, self.subtensor,
                         self.hotkey or "", self.db, self.subnet_core_client,
                         fee_percentage=self.settings.fee_percentage,
+                        netuid=self.settings.netuid,
+                        alpha_per_chunk=self.settings.alpha_per_chunk,
                     )
                     if payment:
                         logger.info(
