@@ -63,7 +63,6 @@ from .reward_manager import RewardManager
 from .epoch_manager import EpochManager
 # BlindWorkerManager removed
 # GatewayManager removed
-from .metagraph_sync import MetagraphSync
 
 # Database imports (optional - legacy, being replaced by SubnetCoreClient)
 try:
@@ -381,7 +380,6 @@ class Orchestrator:
         self._epoch_mgr = EpochManager(self.settings)
         # BlindWorkerManager removed
         # GatewayManager removed
-        self._meta_sync = MetagraphSync(self.settings)
 
         # --- Payment self-limiting ---
         self._consecutive_payment_failures: int = 0
@@ -1051,13 +1049,18 @@ class Orchestrator:
         return self._reward_mgr.distribute_rewards_to_workers(self.get_our_emission)
 
     # =========================================================================
-    # Metagraph & Validators (delegate to MetagraphSync)
+    # Metagraph & Validators
     # =========================================================================
 
     def _find_our_uid(self) -> None:
-        uid = self._meta_sync.find_our_uid(self.metagraph, self.hotkey)
-        if uid is not None:
-            self.our_uid = uid
+        if self.metagraph is None or self.hotkey is None:
+            return
+        for uid in range(len(self.metagraph.hotkeys)):
+            if self.metagraph.hotkeys[uid] == self.hotkey:
+                logger.info(f"Found our UID: {uid}")
+                self.our_uid = uid
+                return
+        logger.warning(f"Hotkey {self.hotkey[:16]}... not found in metagraph")
 
     def get_our_emission(self) -> float:
         """Get our emission converted from alpha to TAO.
@@ -1065,7 +1068,13 @@ class Orchestrator:
         Caches the subnet price for 60s to avoid hammering the subtensor
         websocket (which is not safe for concurrent recv calls).
         """
-        emission_alpha = self._meta_sync.get_our_emission(self.metagraph, self.our_uid)
+        if self.metagraph is None or self.our_uid is None:
+            return 0.0
+        try:
+            emission_alpha = float(self.metagraph.E[self.our_uid])
+        except Exception as e:
+            logger.error(f"Error getting emission: {e}")
+            return 0.0
         if emission_alpha <= 0 or not self.subtensor:
             return emission_alpha
 
