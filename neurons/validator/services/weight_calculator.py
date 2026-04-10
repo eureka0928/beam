@@ -42,6 +42,11 @@ TRUST_THRESHOLD_COMPLIANCE = 0.5
 TRUST_THRESHOLD_VERIFICATION = 0.5
 TRUST_PENALTY = 0.5  # per dimension; stacks -> 0.25 if both fail
 
+# ── Minimum compliance for any emissions ────────────────────────────
+# Orchestrators below this threshold receive zero weight regardless of activity.
+# New orchestrators with no task history default to compliance=1.0 (no penalty).
+MIN_COMPLIANCE_FOR_EMISSIONS = 0.5
+
 # ── Confidence (per-orchestrator, blended) ───────────────────────────
 CONFIDENCE_PROOF_THRESHOLD = 10
 CONFIDENCE_BYTES_THRESHOLD = 1_000_000_000  # 1 GB
@@ -347,7 +352,11 @@ def compute_weights(
         )
         penalty = penalty_multipliers.get(s.orchestrator_hotkey, 1.0)
 
-        raw = exposure_val * quality_final * confidence_val * penalty
+        # Hard compliance gate: below MIN_COMPLIANCE_FOR_EMISSIONS = zero emissions.
+        # Partial payers get nothing. New orchestrators with no task history
+        # default to compliance=1.0 so they are not penalized before their first epoch.
+        effective_comp = comp if comp >= MIN_COMPLIANCE_FOR_EMISSIONS else 0.0
+        raw = exposure_val * quality_final * confidence_val * penalty * effective_comp
         raw = max(0.0, raw)
 
         details.append(OrchestratorWeight(
