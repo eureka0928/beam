@@ -284,8 +284,6 @@ class RewardManager:
 
                 if tx_hash:
                     transfer_success = True
-                    # tx_hash already in "extrinsic_hash:block_hash" format
-                    # from transfer_alpha_with_memo
                     self._payment_success_count += 1
                     # Record payment on PoB record via BeamCore
                     if SUBNET_CORE_CLIENT_AVAILABLE and subnet_core_client:
@@ -460,11 +458,23 @@ class RewardManager:
         if not self._payment_retry_queue or not wallet or not subtensor:
             return
 
-        # transfer_stake uses staked ALPHA, not free TAO — just attempt retries
+        try:
+            balance = subtensor.get_balance(wallet.hotkey.ss58_address)
+            available = float(balance) - 0.001
+        except Exception as e:
+            logger.warning(f"Could not check balance for retry queue: {e}")
+            return
+
+        if available <= 0:
+            logger.debug(
+                f"No balance for payment retries ({len(self._payment_retry_queue)} queued)"
+            )
+            return
+
         logger.info(
-            f"Processing payment retry queue: {len(self._payment_retry_queue)} items"
+            f"Processing payment retry queue: {len(self._payment_retry_queue)} items, "
+            f"{available:.4f} TAO available"
         )
-        available = float('inf')  # let transfer_stake fail naturally if insufficient
 
         completed = set()
         for i, item in enumerate(self._payment_retry_queue):
