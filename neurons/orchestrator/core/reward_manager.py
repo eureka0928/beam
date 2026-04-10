@@ -196,40 +196,10 @@ class RewardManager:
         if max_reward > 0:
             reward = min(reward, max_reward)
 
-        if wallet and subtensor:
-            try:
-                # Cache balance for 10s to keep spending accurate under high throughput
-                import time as _time
-                now = _time.time()
-                if not hasattr(self, '_cached_balance') or (now - getattr(self, '_cached_balance_at', 0)) > 10:
-                    self._cached_balance = float(subtensor.get_balance(wallet.hotkey.ss58_address))
-                    self._cached_balance_at = now
-                available = self._cached_balance
-                fee_buffer = 0.001
-                spendable = max(0.0, available - fee_buffer)
-
-                if reward > spendable:
-                    if spendable <= MIN_CHAIN_TRANSFER:
-                        worker_hk = proof.worker_hotkey if proof else (worker.hotkey if worker else "unknown")
-                        logger.warning(
-                            f"Insufficient balance ({available:.4f} TAO) to pay worker "
-                            f"{worker_hk[:16]}... — queuing {reward:.9f} TAO for retry"
-                        )
-                        self._queue_failed_payment(worker, proof, reward)
-                        return None
-                    else:
-                        shortfall = reward - spendable
-                        logger.warning(
-                            f"Balance cap: {reward:.9f} TAO → {spendable:.9f} TAO "
-                            f"(shortfall {shortfall:.9f}). Queuing remainder."
-                        )
-                        self._queue_failed_payment(worker, proof, shortfall)
-                        reward = spendable
-            except Exception as e:
-                logger.error(f"Could not check balance — queuing payment for retry: {e}")
-                self._queue_failed_payment(worker, proof, reward)
-                self.last_emission_check = current_emission
-                return None
+        # Note: transfer_stake uses staked ALPHA, not free TAO balance.
+        # The on-chain call will fail if insufficient staked ALPHA, so we
+        # let it attempt and queue for retry on failure rather than pre-checking
+        # the wrong balance type.
 
         # Resolve payment address via SubnetCore, with fallback to worker_hotkey
         payment_dest = None
@@ -490,23 +460,11 @@ class RewardManager:
         if not self._payment_retry_queue or not wallet or not subtensor:
             return
 
-        try:
-            balance = subtensor.get_balance(wallet.hotkey.ss58_address)
-            available = float(balance) - 0.001
-        except Exception as e:
-            logger.warning(f"Could not check balance for retry queue: {e}")
-            return
-
-        if available <= 0:
-            logger.debug(
-                f"No balance for payment retries ({len(self._payment_retry_queue)} queued)"
-            )
-            return
-
+        # transfer_stake uses staked ALPHA, not free TAO — just attempt retries
         logger.info(
-            f"Processing payment retry queue: {len(self._payment_retry_queue)} items, "
-            f"{available:.4f} TAO available"
+            f"Processing payment retry queue: {len(self._payment_retry_queue)} items"
         )
+        available = float('inf')  # let transfer_stake fail naturally if insufficient
 
         completed = set()
         for i, item in enumerate(self._payment_retry_queue):
