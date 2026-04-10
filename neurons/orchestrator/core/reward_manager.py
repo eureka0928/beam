@@ -314,20 +314,8 @@ class RewardManager:
 
                 if tx_hash:
                     transfer_success = True
-                    # Extract real blockchain tx hash from ExtrinsicResponse
-                    tx_hash = None
-                    block_hash = None
-                    if hasattr(response, 'extrinsic_receipt') and response.extrinsic_receipt:
-                        receipt = response.extrinsic_receipt
-                        if hasattr(receipt, 'extrinsic_hash') and receipt.extrinsic_hash:
-                            tx_hash = str(receipt.extrinsic_hash)
-                        if hasattr(receipt, 'block_hash') and receipt.block_hash:
-                            block_hash = str(receipt.block_hash)
-                    if not tx_hash:
-                        tx_hash = f"transfer:{hotkey[:8]}:{payment_dest[:8]}:{int(time.time())}"
-                        logger.warning(f"Could not extract real tx hash from response: {type(response)}")
-                    elif block_hash:
-                        tx_hash = f"{tx_hash}:{block_hash}"
+                    # tx_hash already in "extrinsic_hash:block_hash" format
+                    # from transfer_alpha_with_memo
                     self._payment_success_count += 1
                     # Record payment on PoB record via BeamCore
                     if SUBNET_CORE_CLIENT_AVAILABLE and subnet_core_client:
@@ -567,47 +555,46 @@ class RewardManager:
 
             reward = min(item["reward_tao"], available)
 
-            # Top up dust payments to chain minimum (500 rao)
-            MIN_CHAIN_TRANSFER = 5e-7
-            if reward < MIN_CHAIN_TRANSFER:
-                reward = MIN_CHAIN_TRANSFER
-
             try:
-                # Convert reward to Balance object (required by new bittensor API)
-                amount = Balance.from_tao(reward) if Balance else reward
-                response = subtensor.transfer(
+                # Resolve worker coldkey for transfer_stake
+                worker_hotkey = item.get("worker_hotkey", "")
+                worker_coldkey = await self._resolve_worker_coldkey(worker_hotkey, subtensor, netuid=105)
+                if not worker_coldkey:
+                    item["attempts"] += 1
+                    logger.warning(f"Retry: cannot resolve coldkey for {worker_hotkey[:16]}...")
+                    continue
+
+                # ALPHA payment via transfer_stake with on-chain memo
+                alpha_amount = reward if reward > 0.0005 else 0.0005
+                payment_memo = f"retry:{task_id}"
+                tx_hash = await self.transfer_alpha_with_memo(
+                    worker_coldkey=worker_coldkey,
+                    amount_alpha=alpha_amount,
+                    transfer_id=payment_memo,
                     wallet=wallet,
-                    destination_ss58=payment_dest,
-                    amount=amount,
-                    wait_for_inclusion=True,
-                    wait_for_finalization=False,
+                    subtensor=subtensor,
+                    netuid=105,
                 )
-                # Handle both old bool return and new ExtrinsicResponse
-                success = response.is_success if hasattr(response, 'is_success') else bool(response)
-                if success:
+
+                if tx_hash:
                     available -= reward
                     if task_id:
                         self._paid_task_ids.add(task_id)
-                    # Extract real blockchain tx hash from ExtrinsicResponse
-                    # SDK v10+: tx hash is in response.extrinsic_receipt.extrinsic_hash
-                    # Also extract block_hash for on-chain verification
-                    tx_hash = None
-                    block_hash = None
-                    if hasattr(response, 'extrinsic_receipt') and response.extrinsic_receipt:
-                        receipt = response.extrinsic_receipt
-                        if hasattr(receipt, 'extrinsic_hash') and receipt.extrinsic_hash:
-                            tx_hash = str(receipt.extrinsic_hash)
-                        if hasattr(receipt, 'block_hash') and receipt.block_hash:
-                            block_hash = str(receipt.block_hash)
-                    if not tx_hash:
-                        tx_hash = f"retry:{hotkey[:8]}:{payment_dest[:8]}:{int(time.time())}"
-                        logger.warning(f"Could not extract real tx hash from retry response: {type(response)}")
-                    elif block_hash:
-                        # Combine extrinsic_hash:block_hash for validator verification
-                        tx_hash = f"{tx_hash}:{block_hash}"
                     logger.info(
-                        f"Retry payment SUCCESS: {reward:.9f} TAO to {payment_dest[:16]}... tx={tx_hash[:24]}..."
+                        f"Retry payment SUCCESS: {alpha_amount} ALPHA to {worker_coldkey[:16]}... tx={tx_hash[:24]}..."
                     )
+
+                    # Record payment on PoB record via BeamCore
+                    alpha_amount_rao = int(alpha_amount * 1e9)
+                    if SUBNET_CORE_CLIENT_AVAILABLE and subnet_core_client:
+                        try:
+                            await subnet_core_client.record_pob_payment(
+                                task_id=task_id,
+                                tx_hash=tx_hash,
+                                amount_rao=alpha_amount_rao,
+                            )
+                        except Exception as e:
+                            logger.warning(f"Failed to record retry PoB payment: {e}")
 
                     proof = item["proof"]
                     reward_nano = int(reward * 1e9)
@@ -651,7 +638,7 @@ class RewardManager:
                 else:
                     item["attempts"] += 1
                     logger.warning(
-                        f"Retry transfer failed for task {task_id[:16]}... "
+                        f"Retry ALPHA transfer failed for task {task_id[:16]}... "
                         f"(attempt {item['attempts']}/{self._max_payment_retries})"
                     )
             except Exception as e:
@@ -666,7 +653,7 @@ class RewardManager:
             item = self._payment_retry_queue[i]
             logger.error(
                 f"Payment retry EXHAUSTED ({self._max_payment_retries} attempts) for "
-                f"task {item.get('task_id', 'unknown')[:16]}... — {item['reward_tao']:.9f} TAO lost"
+                f"task {item.get('task_id', 'unknown')[:16]}... — {item['reward_tao']:.9f} ALPHA lost"
             )
 
         self._payment_retry_queue = [
