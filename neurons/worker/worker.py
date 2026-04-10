@@ -45,6 +45,12 @@ from typing import Any, Dict, List, Optional
 import httpx
 
 try:
+    from httpx_socks import AsyncProxyTransport
+    HTTPX_SOCKS_AVAILABLE = True
+except ImportError:
+    HTTPX_SOCKS_AVAILABLE = False
+
+try:
     import websockets
     from websockets.exceptions import ConnectionClosed, InvalidStatusCode
     WEBSOCKETS_AVAILABLE = True
@@ -1128,10 +1134,19 @@ async def run_worker(state: WorkerState):
     """Run the worker: register, affiliate, then poll for tasks."""
     hotkey = state.wallet.hotkey.ss58_address
 
-    state.http_client = httpx.AsyncClient(
-        timeout=httpx.Timeout(connect=10.0, read=60.0, write=60.0, pool=5.0),
-        limits=httpx.Limits(max_connections=20, max_keepalive_connections=10),
-    )
+    proxy_url = os.environ.get("BEAM_WORKER_PROXY", "")
+    if proxy_url and HTTPX_SOCKS_AVAILABLE and proxy_url.startswith("socks"):
+        transport = AsyncProxyTransport.from_url(proxy_url)
+        state.http_client = httpx.AsyncClient(
+            transport=transport,
+            timeout=httpx.Timeout(connect=10.0, read=60.0, write=60.0, pool=5.0),
+            limits=httpx.Limits(max_connections=20, max_keepalive_connections=10),
+        )
+    else:
+        state.http_client = httpx.AsyncClient(
+            timeout=httpx.Timeout(connect=10.0, read=60.0, write=60.0, pool=5.0),
+            limits=httpx.Limits(max_connections=20, max_keepalive_connections=10),
+        )
 
     try:
         # Register with BeamCore
