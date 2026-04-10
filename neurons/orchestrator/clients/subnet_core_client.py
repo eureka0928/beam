@@ -1297,7 +1297,7 @@ class SubnetCoreClient:
             raise
 
     async def get_worker(self, worker_id: str) -> Dict[str, Any]:
-        """Get a specific worker."""
+        """Get a specific worker (affiliation-scoped)."""
         client = await self._get_client()
 
         try:
@@ -1313,6 +1313,27 @@ class SubnetCoreClient:
         except Exception as e:
             logger.error(f"Error getting worker: {e}")
             raise
+
+    async def get_worker_hotkey(self, worker_id: str) -> Optional[str]:
+        """
+        Resolve a worker_id to its hotkey regardless of affiliation.
+
+        Uses the unscoped /workers/{id}/hotkey endpoint — unlike get_worker()
+        this works for workers completing tasks on behalf of other orchestrators
+        (e.g. speculative/recovery tasks assigned cross-orchestrator).
+        """
+        client = await self._get_client()
+
+        try:
+            response = await client.get(
+                f"{self.base_url}/orchestrators/workers/{worker_id}/hotkey",
+            )
+            response.raise_for_status()
+            data = response.json()
+            return data.get("hotkey")
+        except Exception as e:
+            logger.debug(f"Hotkey lookup failed for {worker_id[:16]}...: {e}")
+            return None
 
     # =========================================================================
     # Payment Address Resolution
