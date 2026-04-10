@@ -1658,14 +1658,15 @@ class Orchestrator:
             # Get worker hotkey from message or lookup
             if not worker_hotkey:
                 worker = self.workers.get(worker_id)
-                if worker:
+                if worker and worker.hotkey:
                     worker_hotkey = worker.hotkey
-                elif self.subnet_core_client:
+                if not worker_hotkey and self.subnet_core_client:
                     try:
-                        worker_data = await self.subnet_core_client.get_worker(worker_id)
-                        worker_hotkey = worker_data.get("hotkey", "")
+                        # Use unscoped hotkey endpoint — works for workers
+                        # completing tasks cross-orchestrator (recovery/speculative)
+                        worker_hotkey = await self.subnet_core_client.get_worker_hotkey(worker_id) or ""
                     except Exception as e:
-                        logger.warning(f"Worker lookup failed for {worker_id}: {e}")
+                        logger.warning(f"Worker hotkey lookup failed for {worker_id}: {e}")
 
             if worker_hotkey:
                 # Use timing from message if available, otherwise estimate
