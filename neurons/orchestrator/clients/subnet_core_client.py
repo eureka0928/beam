@@ -262,6 +262,7 @@ class SubnetCoreClient:
         self._transfer_handler: Optional[Callable] = None
         self._stale_task_handler: Optional[Callable] = None  # Handler for stale tasks
         self._stats_provider: Optional[Callable] = None  # Returns heartbeat stats
+        self._worker_update_handler: Optional[Callable] = None  # Handler for worker connect/disconnect push events
         self._polling_tasks: List[asyncio.Task] = []
         self._running = False
 
@@ -325,6 +326,15 @@ class SubnetCoreClient:
             - pending_payments: int
         """
         self._stats_provider = provider
+
+    def set_worker_update_handler(self, handler: Callable):
+        """
+        Set handler for worker connect/disconnect push events.
+
+        Handler signature: async def handler(worker_id: str, event: str) -> None
+        Where event is "connected" or "disconnected".
+        """
+        self._worker_update_handler = handler
 
     # =========================================================================
     # WebSocket Connection (Primary) + HTTP Polling (Fallback)
@@ -659,8 +669,15 @@ class SubnetCoreClient:
                     logger.error(f"Error handling stale task: {e}")
 
         elif msg_type == "worker_update":
-            # Worker status change
-            logger.debug(f"Worker update: {data.get('worker_id')} - {data.get('event')}")
+            # Worker connect/disconnect push event
+            worker_id = data.get("worker_id")
+            event = data.get("event")
+            logger.debug(f"Worker update: {worker_id} - {event}")
+            if self._worker_update_handler and worker_id and event:
+                try:
+                    await self._worker_update_handler(worker_id, event)
+                except Exception as e:
+                    logger.error(f"Error handling worker_update: {e}")
 
         elif msg_type == "heartbeat_ack":
             logger.debug("WebSocket heartbeat acknowledged")

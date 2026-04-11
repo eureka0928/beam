@@ -379,48 +379,53 @@ class WorkerManager:
         region: Optional[str] = None,
         min_bandwidth: float = 0.0,
     ) -> List[Any]:
-        """Get list of available workers from SubnetCore."""
-        from .orchestrator import Worker, WorkerStatus
-
-        # Query SubnetCore for workers (source of truth)
-        subnet_core_client = self._get_subnet_core_client()
-        if subnet_core_client:
-            try:
-                workers_data = await subnet_core_client.list_workers(
-                    status="active",
-                    region=region,
-                )
-                workers_list = workers_data.get("workers", [])
-                logger.debug(f"Got {len(workers_list)} workers from SubnetCore")
-
-                # Convert to Worker objects
-                result = []
-                for w in workers_list:
-                    bandwidth = w.get("bandwidth_mbps", 0.0)
-                    if bandwidth >= min_bandwidth:
-                        worker = Worker(
-                            worker_id=w.get("worker_id", ""),
-                            hotkey=w.get("hotkey", ""),
-                            ip=w.get("ip", ""),
-                            port=w.get("port", 0),
-                            region=w.get("region", "unknown"),
-                            bandwidth_mbps=bandwidth,
-                            status=WorkerStatus.ACTIVE,
-                            trust_score=w.get("trust_score", 0.5),
-                        )
-                        result.append(worker)
-                return result
-            except Exception as e:
-                logger.warning(f"Failed to get workers from SubnetCore: {e}")
-
-        # Fallback to local cache if SubnetCore unavailable
+        """Get available workers from local cache (kept live by push events + periodic sync)."""
         workers = [
             w for w in self.workers.values()
             if w.is_available and w.bandwidth_mbps >= min_bandwidth
         ]
         if region:
             workers = [w for w in workers if w.region == region]
+        logger.debug(f"get_available_workers: {len(workers)} active workers in local cache")
         return workers
+
+    async def handle_worker_update(self, worker_id: str, event: str) -> None:
+        """
+        Handle a worker_update push event from SubnetCore WebSocket.
+
+        Called when SubnetCore pushes a worker connect/disconnect event.
+        Updates local cache immediately so task dispatch reflects real-time state
+        without polling GET /orchestrators/workers.
+        """
+        from .orchestrator import Worker, WorkerStatus
+
+        if event == "connected":
+            if worker_id not in self.workers:
+                # Add minimal skeleton; sync_workers_from_subnetcore() will fill details
+                worker = Worker(
+                    worker_id=worker_id,
+                    hotkey="",
+                    ip="0.0.0.0",
+                    port=0,
+                    region="unknown",
+                    bandwidth_mbps=0.0,
+                    status=WorkerStatus.ACTIVE,
+                )
+                self.workers[worker_id] = worker
+                logger.info(f"Worker {worker_id[:20]}... added to local cache (push: connected)")
+            else:
+                # Reactivate if previously offline
+                existing = self.workers[worker_id]
+                if existing.status != WorkerStatus.ACTIVE:
+                    existing.status = WorkerStatus.ACTIVE
+                    existing.last_seen = datetime.utcnow()
+                    logger.info(f"Worker {worker_id[:20]}... reactivated in local cache (push: connected)")
+
+        elif event == "disconnected":
+            worker = self.workers.get(worker_id)
+            if worker:
+                worker.status = WorkerStatus.OFFLINE
+                logger.info(f"Worker {worker_id[:20]}... marked offline in local cache (push: disconnected)")
 
     def register_worker_connection(self, worker_id: str, websocket: Any) -> None:
         """Register a worker's WebSocket connection."""

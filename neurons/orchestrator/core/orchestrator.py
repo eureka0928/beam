@@ -1572,6 +1572,7 @@ class Orchestrator:
             self.subnet_core_client.set_task_completion_handler(self._handle_task_completion_notification)
             self.subnet_core_client.set_transfer_handler(self._handle_transfer_notification)
             self.subnet_core_client.set_stats_provider(self._get_heartbeat_stats)
+            self.subnet_core_client.set_worker_update_handler(self._worker_mgr.handle_worker_update)
 
             # Start WebSocket connection for real-time notifications
             # WebSocket replaces HTTP polling for transfers and task results
