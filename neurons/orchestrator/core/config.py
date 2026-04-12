@@ -84,6 +84,14 @@ class OrchestratorSettings(BaseSettings):
     alpha_per_chunk: float = Field(default=0.5, env="ALPHA_PER_CHUNK")
 
     # ==========================================================================
+    # Readiness
+    # ==========================================================================
+    # When True, orchestrator signals BeamCore that it is ready to receive transfers.
+    # Set via READY=true env var or call PATCH /orchestrators/ready at runtime.
+    # Default is False — new orchestrators are excluded from routing until explicit opt-in.
+    ready: bool = Field(default=False, env="READY")
+
+    # ==========================================================================
     # Worker Management
     # ==========================================================================
     max_workers: int = Field(default=10000, env="MAX_WORKERS")

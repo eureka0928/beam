@@ -514,10 +514,28 @@ async def lifespan(app: FastAPI):
     # NOTE: WebSocket connection is handled by SubnetCoreClient
     logger.info("WebSocket connection handled by SubnetCoreClient")
 
+    # Signal readiness to receive transfers (controlled by READY env var / config)
+    if settings.ready and orchestrator.subnet_core_client:
+        try:
+            await orchestrator.subnet_core_client.set_ready(True)
+            logger.info("Signalled ready=True to BeamCore — orchestrator will receive transfers")
+        except Exception as e:
+            logger.warning(f"Failed to set ready=True on BeamCore: {e}")
+    else:
+        logger.info("ready=False (default) — orchestrator will NOT receive transfers until READY=true is set")
+
     yield
 
     # Cleanup
     logger.info("Shutting down BEAM Orchestrator...")
+
+    # Signal not-ready before stopping so BeamCore stops routing traffic immediately
+    if orchestrator.subnet_core_client:
+        try:
+            await orchestrator.subnet_core_client.set_ready(False)
+            logger.info("Signalled ready=False to BeamCore — orchestrator removed from routing")
+        except Exception as e:
+            logger.warning(f"Failed to set ready=False on BeamCore during shutdown: {e}")
 
     await orchestrator.stop()
     await metrics_collector.stop()

@@ -914,6 +914,34 @@ class SubnetCoreClient:
             logger.error(f"Error sending heartbeat: {e}")
             raise
 
+    async def set_ready(self, ready: bool) -> bool:
+        """
+        Toggle this orchestrator's readiness to receive transfers on BeamCore.
+
+        PATCH /orchestrators/ready
+        Returns the new ready state as confirmed by BeamCore.
+        """
+        client = await self._get_client()
+        try:
+            response = await client.patch(
+                f"{self.base_url}/orchestrators/ready",
+                json={"ready": ready},
+            )
+            response.raise_for_status()
+            result = response.json()
+            confirmed = result.get("ready", ready)
+            logger.info(
+                f"Orchestrator ready={confirmed} set on BeamCore "
+                f"(uid={result.get('uid')})"
+            )
+            return confirmed
+        except httpx.HTTPStatusError as e:
+            logger.error(f"HTTP error setting ready flag: {e.response.status_code} - {e.response.text[:200]}")
+            raise
+        except Exception as e:
+            logger.error(f"Error setting ready flag: {e}")
+            raise
+
     async def get_pending_transfers(self) -> List[Dict[str, Any]]:
         """
         Poll for pending transfers.
