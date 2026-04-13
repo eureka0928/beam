@@ -36,6 +36,7 @@ import asyncio
 import hashlib
 import json
 import os
+import random
 import signal
 import sys
 import time
@@ -49,6 +50,12 @@ try:
     HTTPX_SOCKS_AVAILABLE = True
 except ImportError:
     HTTPX_SOCKS_AVAILABLE = False
+
+try:
+    import h2  # noqa: F401
+    HTTP2_AVAILABLE = True
+except ImportError:
+    HTTP2_AVAILABLE = False
 
 try:
     import websockets
@@ -80,6 +87,7 @@ CONNECTION_MODE = os.environ.get("CONNECTION_MODE", "auto")
 # Intervals
 HEARTBEAT_INTERVAL = 30  # seconds
 TASK_POLL_INTERVAL = 30  # seconds (keep low to avoid rate limits)
+HEARTBEAT_FAILURE_THRESHOLD = 5  # force re-register after this many consecutive failures
 
 # WebSocket settings
 WS_RECONNECT_MIN_DELAY = 12.0   # must exceed server's 10s cooldown
@@ -110,6 +118,8 @@ class WorkerState:
     active_tasks: int = 0
     bytes_relayed: int = 0
     running: bool = True
+    measured_bandwidth_mbps: float = 0.0  # EMA of recent task bandwidth
+    heartbeat_failures: int = 0
     http_client: Optional[httpx.AsyncClient] = None
     ws_connected: bool = False
     ws_reconnect_attempts: int = 0
@@ -283,7 +293,7 @@ async def send_heartbeat(client: httpx.AsyncClient, state: WorkerState) -> bool:
             json={
                 "worker_id": state.worker_id,
                 "hotkey": hotkey,
-                "bandwidth_mbps": 100.0,
+                "bandwidth_mbps": state.measured_bandwidth_mbps or 100.0,
                 "active_tasks": state.active_tasks,
                 "bytes_relayed": state.bytes_relayed,
                 "signature": signature,
@@ -300,6 +310,34 @@ async def send_heartbeat(client: httpx.AsyncClient, state: WorkerState) -> bool:
     except Exception as e:
         print(f"[Worker] Heartbeat error: {e}")
         return False
+
+
+async def track_heartbeat(state: WorkerState, ok: bool) -> None:
+    """Update heartbeat health and force re-registration if it's been failing."""
+    if ok:
+        if state.heartbeat_failures:
+            print(f"[Worker] Heartbeat recovered after {state.heartbeat_failures} failures")
+        state.heartbeat_failures = 0
+        return
+
+    state.heartbeat_failures += 1
+    print(
+        f"[Worker] Heartbeat failure #{state.heartbeat_failures}/{HEARTBEAT_FAILURE_THRESHOLD}"
+    )
+    if state.heartbeat_failures < HEARTBEAT_FAILURE_THRESHOLD:
+        return
+
+    print("[Worker] Heartbeat failure threshold reached, attempting re-registration")
+    try:
+        result = await register_worker(state.http_client, state)
+        state.worker_id = result.get("worker_id") or state.worker_id
+        new_api_key = result.get("api_key")
+        if new_api_key:
+            state.api_key = new_api_key
+        state.heartbeat_failures = 0
+        print(f"[Worker] Re-registered as {state.worker_id}")
+    except Exception as e:
+        print(f"[Worker] Re-registration failed: {e}")
 
 
 async def poll_worker_tasks(client: httpx.AsyncClient, state: WorkerState) -> List[Dict[str, Any]]:
@@ -442,9 +480,41 @@ def is_retryable(error: Exception) -> bool:
     """Check if an error is retryable."""
     if isinstance(error, (asyncio.TimeoutError, httpx.TimeoutException)):
         return True
+    if isinstance(
+        error,
+        (
+            httpx.ConnectError,
+            httpx.ReadError,
+            httpx.WriteError,
+            httpx.RemoteProtocolError,
+            httpx.PoolTimeout,
+        ),
+    ):
+        return True
     if isinstance(error, httpx.HTTPStatusError):
-        return error.response.status_code >= 500
+        code = error.response.status_code
+        return code >= 500 or code in (408, 429)
     return False
+
+
+MAX_RETRY_SLEEP = 5.0  # cap so backoff can't dominate a tight request timeout
+
+
+def retry_sleep(attempt: int) -> float:
+    """Exponential backoff with jitter to avoid thundering herd."""
+    base = RETRY_BACKOFF * (2 ** attempt)
+    return min(MAX_RETRY_SLEEP, base) * random.uniform(0.5, 1.5)
+
+
+def chunk_timeout(num_bytes: Optional[int], base: int) -> float:
+    """Dynamic per-request timeout scaled to chunk size.
+
+    Assumes ~10 MB/s floor throughput; clamps to [5s, base].
+    """
+    if not num_bytes or num_bytes <= 0:
+        return float(base)
+    per_mb = num_bytes / (10 * 1024 * 1024)  # seconds at 10 MB/s
+    return max(5.0, min(float(base), 5.0 + per_mb * 2.0))
 
 
 async def fetch_chunk(
@@ -455,7 +525,10 @@ async def fetch_chunk(
     total_size: int = None,
 ) -> bytes:
     """Fetch chunk data from source URL."""
-    headers = {"ngrok-skip-browser-warning": "true"}
+    headers = {
+        "ngrok-skip-browser-warning": "true",
+        "Accept-Encoding": "gzip, deflate",
+    }
 
     if chunk_offset is not None and chunk_size is not None:
         if total_size is not None:
@@ -464,9 +537,11 @@ async def fetch_chunk(
             range_end = chunk_offset + chunk_size - 1
         headers["Range"] = f"bytes={chunk_offset}-{range_end}"
 
+    timeout = chunk_timeout(chunk_size, FETCH_TIMEOUT)
+
     for attempt in range(MAX_RETRIES):
         try:
-            response = await client.get(url, headers=headers, timeout=FETCH_TIMEOUT)
+            response = await client.get(url, headers=headers, timeout=timeout)
             if response.status_code not in (200, 206):
                 response.raise_for_status()
             return response.content
@@ -474,7 +549,7 @@ async def fetch_chunk(
         except Exception as e:
             if not is_retryable(e) or attempt == MAX_RETRIES - 1:
                 raise
-            await asyncio.sleep(RETRY_BACKOFF * (2 ** attempt))
+            await asyncio.sleep(retry_sleep(attempt))
 
     raise Exception("Max retries exceeded")
 
@@ -500,6 +575,7 @@ async def send_chunk(
     chunk_offset: int = 0,
     total_size: int = 0,
     auth_token: str = None,
+    chunk_sha256: Optional[str] = None,
 ) -> tuple:
     """Send chunk data to destination URL.
 
@@ -510,7 +586,8 @@ async def send_chunk(
     if is_s3:
         headers = {"Content-Type": "application/octet-stream"}
     else:
-        chunk_sha256 = hashlib.sha256(data).hexdigest()
+        if chunk_sha256 is None:
+            chunk_sha256 = hashlib.sha256(data).hexdigest()
         headers = {
             "Content-Type": "application/octet-stream",
             "X-Transfer-ID": transfer_id,
@@ -523,15 +600,17 @@ async def send_chunk(
         if auth_token:
             headers["Authorization"] = f"Bearer {auth_token}"
 
+    timeout = chunk_timeout(len(data), SEND_TIMEOUT)
+
     for attempt in range(MAX_RETRIES):
         try:
             if is_s3:
                 response = await client.put(
-                    destination_url, content=data, headers=headers, timeout=SEND_TIMEOUT
+                    destination_url, content=data, headers=headers, timeout=timeout
                 )
             else:
                 response = await client.post(
-                    destination_url, content=data, headers=headers, timeout=SEND_TIMEOUT
+                    destination_url, content=data, headers=headers, timeout=timeout
                 )
 
             response.raise_for_status()
@@ -541,7 +620,7 @@ async def send_chunk(
         except Exception as e:
             if not is_retryable(e) or attempt == MAX_RETRIES - 1:
                 raise
-            await asyncio.sleep(RETRY_BACKOFF * (2 ** attempt))
+            await asyncio.sleep(retry_sleep(attempt))
 
     raise Exception("Max retries exceeded")
 
@@ -589,77 +668,89 @@ async def execute_transfer(
 
     print(f"[Worker] Transferring {len(chunk_indices)} chunk(s)")
 
-    for chunk_index in chunk_indices:
-        chunk_key = str(chunk_index)
+    pending_acks: List[asyncio.Task] = []
 
-        # Resolve source URL
-        if source_urls and chunk_key in source_urls:
-            final_url = source_urls[chunk_key]
-        elif object_id:
-            base = gateway_url.rstrip("/")
-            final_url = f"{base}/objects/{object_id}"
-        else:
-            base = gateway_url.rstrip("/")
-            final_url = f"{base}/chunks/{transfer_id}/{chunk_index}"
+    try:
+        for chunk_index in chunk_indices:
+            chunk_key = str(chunk_index)
 
-        # Resolve destination URL
-        if dest_urls and chunk_key in dest_urls:
-            chunk_dest_url = dest_urls[chunk_key]
-        else:
-            chunk_dest_url = destination_url
+            # Resolve source URL
+            if source_urls and chunk_key in source_urls:
+                final_url = source_urls[chunk_key]
+            elif object_id:
+                base = gateway_url.rstrip("/")
+                final_url = f"{base}/objects/{object_id}"
+            else:
+                base = gateway_url.rstrip("/")
+                final_url = f"{base}/chunks/{transfer_id}/{chunk_index}"
 
-        use_range = object_id is not None and chunk_offset is not None and chunk_size_ctx is not None
+            # Resolve destination URL
+            if dest_urls and chunk_key in dest_urls:
+                chunk_dest_url = dest_urls[chunk_key]
+            else:
+                chunk_dest_url = destination_url
 
-        # Check deadline
-        if deadline_us > 0:
-            now_us = time.time() * 1_000_000
-            remaining_us = deadline_us - now_us
-            if remaining_us <= 0:
-                return (total_bytes, False, f"Deadline exceeded before chunk {chunk_index}", "")
+            use_range = object_id is not None and chunk_offset is not None and chunk_size_ctx is not None
 
-        try:
-            # Fetch chunk
-            data = await fetch_chunk(
-                client, final_url,
-                chunk_offset=chunk_offset if use_range else None,
-                chunk_size=chunk_size_ctx if use_range else None,
-                total_size=total_size if use_range else None,
-            )
+            # Check deadline
+            if deadline_us > 0:
+                now_us = time.time() * 1_000_000
+                remaining_us = deadline_us - now_us
+                if remaining_us <= 0:
+                    return (total_bytes, False, f"Deadline exceeded before chunk {chunk_index}", "")
 
-            bytes_fetched = len(data)
-            computed_chunk_hash = hashlib.sha256(data).hexdigest()
+            try:
+                # Fetch chunk
+                data = await fetch_chunk(
+                    client, final_url,
+                    chunk_offset=chunk_offset if use_range else None,
+                    chunk_size=chunk_size_ctx if use_range else None,
+                    total_size=total_size if use_range else None,
+                )
 
-            # Send chunk (or skip for canary)
-            if is_canary:
-                print(f"[Worker] Chunk {chunk_index}: CANARY mode, skipping upload")
+                bytes_fetched = len(data)
+                computed_chunk_hash = hashlib.sha256(data).hexdigest()
+
+                # Send chunk (or skip for canary)
+                if is_canary:
+                    print(f"[Worker] Chunk {chunk_index}: CANARY mode, skipping upload")
+                    total_bytes += bytes_fetched
+                    continue
+
+                send_success, etag, response_code = await send_chunk(
+                    client, chunk_dest_url, data, transfer_id, chunk_index,
+                    chunk_offset=chunk_offset if use_range else 0,
+                    total_size=total_size,
+                    auth_token=auth_token,
+                    chunk_sha256=computed_chunk_hash,
+                )
+
+                # Report chunk completion in the background so the next fetch
+                # doesn't block on the BeamCore round-trip.
+                pending_acks.append(
+                    asyncio.create_task(
+                        report_chunk_complete(
+                            client, state, transfer_id, chunk_index,
+                            etag=etag, response_code=response_code,
+                        )
+                    )
+                )
+
                 total_bytes += bytes_fetched
-                continue
+                print(f"[Worker] Chunk {chunk_index}: {bytes_fetched} bytes transferred")
 
-            send_success, etag, response_code = await send_chunk(
-                client, chunk_dest_url, data, transfer_id, chunk_index,
-                chunk_offset=chunk_offset if use_range else 0,
-                total_size=total_size,
-                auth_token=auth_token,
-            )
+            except asyncio.TimeoutError:
+                return (total_bytes, False, f"Deadline exceeded at chunk {chunk_index}", "")
+            except httpx.HTTPStatusError as e:
+                return (total_bytes, False, f"HTTP {e.response.status_code} at chunk {chunk_index}", "")
+            except Exception as e:
+                return (total_bytes, False, f"Error at chunk {chunk_index}: {e}", "")
 
-            # Report chunk completion
-            await report_chunk_complete(
-                client, state, transfer_id, chunk_index,
-                etag=etag, response_code=response_code,
-            )
-
-            total_bytes += bytes_fetched
-            print(f"[Worker] Chunk {chunk_index}: {bytes_fetched} bytes transferred")
-
-        except asyncio.TimeoutError:
-            return (total_bytes, False, f"Deadline exceeded at chunk {chunk_index}", "")
-        except httpx.HTTPStatusError as e:
-            return (total_bytes, False, f"HTTP {e.response.status_code} at chunk {chunk_index}", "")
-        except Exception as e:
-            return (total_bytes, False, f"Error at chunk {chunk_index}: {e}", "")
-
-    print(f"[Worker] Transfer complete: {total_bytes} bytes")
-    return (total_bytes, True, None, computed_chunk_hash)
+        print(f"[Worker] Transfer complete: {total_bytes} bytes")
+        return (total_bytes, True, None, computed_chunk_hash)
+    finally:
+        if pending_acks:
+            await asyncio.gather(*pending_acks, return_exceptions=True)
 
 
 # =============================================================================
@@ -752,6 +843,11 @@ async def handle_task(state: WorkerState, task: dict) -> bool:
 
     if success:
         state.bytes_relayed += bytes_transferred
+        if bandwidth_mbps > 0:
+            prev = state.measured_bandwidth_mbps
+            state.measured_bandwidth_mbps = (
+                bandwidth_mbps if prev == 0 else prev * 0.7 + bandwidth_mbps * 0.3
+            )
 
     state.active_tasks -= 1
 
@@ -788,7 +884,7 @@ async def ws_send_heartbeat(websocket, state: WorkerState) -> bool:
             "type": "heartbeat",
             "worker_id": state.worker_id,
             "hotkey": state.wallet.hotkey.ss58_address,
-            "bandwidth_mbps": 100.0,
+            "bandwidth_mbps": state.measured_bandwidth_mbps or 100.0,
             "tasks_active": state.active_tasks,
             "bytes_relayed": state.bytes_relayed,
         }
@@ -943,6 +1039,11 @@ async def handle_ws_task(state: WorkerState, websocket, task: dict) -> bool:
 
     if success:
         state.bytes_relayed += bytes_transferred
+        if bandwidth_mbps > 0:
+            prev = state.measured_bandwidth_mbps
+            state.measured_bandwidth_mbps = (
+                bandwidth_mbps if prev == 0 else prev * 0.7 + bandwidth_mbps * 0.3
+            )
 
     state.active_tasks -= 1
 
@@ -961,11 +1062,12 @@ async def websocket_loop(state: WorkerState):
         state.use_websocket = False
         return
 
-    ws_url = get_ws_url(state.worker_id, state.api_key, state.api_url)
-    print(f"[Worker] Connecting to WebSocket: {ws_url.split('?')[0]}")
     reconnect_delay = WS_RECONNECT_MIN_DELAY
+    print(f"[Worker] Connecting to WebSocket: {state.api_url}/ws/...")
 
     while state.running and state.use_websocket:
+        # Recompute each iteration so re-registration (new worker_id/api_key) takes effect.
+        ws_url = get_ws_url(state.worker_id, state.api_key, state.api_url)
         try:
             async with websockets.connect(
                 ws_url,
@@ -1033,7 +1135,8 @@ async def websocket_loop(state: WorkerState):
 
                         now = time.time()
                         if now - last_heartbeat >= WS_HEARTBEAT_INTERVAL:
-                            await ws_send_heartbeat(websocket, state)
+                            hb_ok = await ws_send_heartbeat(websocket, state)
+                            await track_heartbeat(state, hb_ok)
                             last_heartbeat = now
 
                     except ConnectionClosed as e:
@@ -1092,7 +1195,8 @@ async def polling_loop(state: WorkerState):
             # Send heartbeat periodically
             now = time.time()
             if now - last_heartbeat >= HEARTBEAT_INTERVAL:
-                await send_heartbeat(state.http_client, state)
+                hb_ok = await send_heartbeat(state.http_client, state)
+                await track_heartbeat(state, hb_ok)
                 last_heartbeat = now
                 heartbeat_count += 1
                 if heartbeat_count % 10 == 1:
@@ -1135,18 +1239,24 @@ async def run_worker(state: WorkerState):
     hotkey = state.wallet.hotkey.ss58_address
 
     proxy_url = os.environ.get("BEAM_WORKER_PROXY", "")
-    if proxy_url and HTTPX_SOCKS_AVAILABLE and proxy_url.startswith("socks"):
+    use_socks_proxy = bool(
+        proxy_url and HTTPX_SOCKS_AVAILABLE and proxy_url.startswith("socks")
+    )
+
+    client_kwargs = dict(
+        timeout=httpx.Timeout(connect=10.0, read=60.0, write=60.0, pool=5.0),
+        limits=httpx.Limits(max_connections=32, max_keepalive_connections=16),
+    )
+    # HTTP/2 is only safe on direct connections; the SOCKS transport doesn't
+    # negotiate ALPN, so leave it off when we're actually proxying.
+    if HTTP2_AVAILABLE and not use_socks_proxy:
+        client_kwargs["http2"] = True
+
+    if use_socks_proxy:
         transport = AsyncProxyTransport.from_url(proxy_url)
-        state.http_client = httpx.AsyncClient(
-            transport=transport,
-            timeout=httpx.Timeout(connect=10.0, read=60.0, write=60.0, pool=5.0),
-            limits=httpx.Limits(max_connections=20, max_keepalive_connections=10),
-        )
+        state.http_client = httpx.AsyncClient(transport=transport, **client_kwargs)
     else:
-        state.http_client = httpx.AsyncClient(
-            timeout=httpx.Timeout(connect=10.0, read=60.0, write=60.0, pool=5.0),
-            limits=httpx.Limits(max_connections=20, max_keepalive_connections=10),
-        )
+        state.http_client = httpx.AsyncClient(**client_kwargs)
 
     try:
         # Register with BeamCore
