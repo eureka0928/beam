@@ -254,11 +254,12 @@ class RewardManager:
         # =====================================================================
         if transfer_id and wallet and subtensor:
             try:
-                # Use pre-resolved coldkey from BeamCore if available (skips metagraph lookup)
-                # This is set when the task_result is pushed via WS — workers_v2.coldkey
+                # Resolve worker coldkey for transfer_stake payment
+                # Priority: 1) proof.worker_coldkey (from WS push), 2) BeamCore API, 3) metagraph
                 worker_coldkey = getattr(proof, "worker_coldkey", "") or ""
+                if not worker_coldkey and SUBNET_CORE_CLIENT_AVAILABLE and subnet_core_client:
+                    worker_coldkey = await subnet_core_client.get_worker_coldkey(proof.worker_id)
                 if not worker_coldkey:
-                    # Fallback: resolve from metagraph via hotkey
                     worker_coldkey = await self._resolve_worker_coldkey(worker_hotkey, subtensor, netuid)
                 if not worker_coldkey:
                     logger.error(
@@ -525,8 +526,14 @@ class RewardManager:
 
             try:
                 # Resolve worker coldkey for transfer_stake
+                # Priority: BeamCore API (fast) -> metagraph (slow fallback)
                 worker_hotkey = item.get("worker_hotkey", "")
-                worker_coldkey = await self._resolve_worker_coldkey(worker_hotkey, subtensor, netuid=105)
+                worker_id = item.get("worker_id", "")
+                worker_coldkey = None
+                if SUBNET_CORE_CLIENT_AVAILABLE and subnet_core_client and worker_id:
+                    worker_coldkey = await subnet_core_client.get_worker_coldkey(worker_id)
+                if not worker_coldkey:
+                    worker_coldkey = await self._resolve_worker_coldkey(worker_hotkey, subtensor, netuid=105)
                 if not worker_coldkey:
                     item["attempts"] += 1
                     logger.warning(f"Retry: cannot resolve coldkey for {worker_hotkey[:16]}...")
