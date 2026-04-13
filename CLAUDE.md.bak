@@ -1,0 +1,94 @@
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
+## Project Overview
+
+BEAM is a decentralized bandwidth coordination layer on the Bittensor network. It aggregates distributed bandwidth from participants and coordinates data transfers with Proof-of-Bandwidth validation. The repo contains two neuron types: **orchestrators** (miners) and **validators**.
+
+## Build & Development Commands
+
+```bash
+# Install
+pip install -e ".[dev]"           # Dev dependencies (pytest, black, ruff, mypy)
+pip install -e ".[validator]"     # Validator extras (torch, networkx)
+
+# Lint & Format
+black --check .                   # Check formatting (line-length 100)
+black .                           # Auto-format
+ruff check .                      # Lint (E, F, I, W rules; E501 ignored)
+ruff check --fix .                # Auto-fix lint issues
+
+# Type Check
+mypy src/ --ignore-missing-imports
+
+# Test
+pytest tests/ -v --tb=short       # asyncio_mode = "auto" (no markers needed)
+
+# Run Orchestrator
+cd neurons/orchestrator && python main.py
+
+# Run Validator
+cd neurons/validator && python main.py
+```
+
+## Architecture
+
+```
+beam/
+├── beam/                    # Shared package (minimal)
+├── neurons/
+│   ├── shared/              # Shared utilities (Merkle tree for payments)
+│   ├── orchestrator/        # Miner node - coordinates bandwidth work
+│   │   ├── main.py          # Entry point (FastAPI app)
+│   │   ├── core/            # Core logic
+│   │   │   ├── orchestrator.py    # Main Orchestrator class (~2000 lines)
+│   │   │   ├── config.py          # OrchestratorSettings (Pydantic)
+│   │   │   ├── worker_manager.py  # Worker pool lifecycle
+│   │   │   ├── task_scheduler.py  # Chunk assignment to workers
+│   │   │   ├── proof_aggregator.py # PoB collection
+│   │   │   ├── reward_manager.py  # Worker payment distribution
+│   │   │   ├── epoch_manager.py   # Epoch cycle tracking
+│   │   │   └── metagraph_sync.py  # Bittensor chain sync
+│   │   ├── clients/         # BeamCore API client
+│   │   ├── routes/          # FastAPI endpoints (health, registration)
+│   │   ├── middleware/      # Rate limiting, Prometheus metrics
+│   │   └── db/              # Optional PostgreSQL persistence
+│   └── validator/           # Validator node - verifies proofs, sets weights
+│       ├── main.py          # Entry point
+│       ├── core/
+│       │   ├── validator.py       # Main Validator class (~3500 lines)
+│       │   ├── config.py          # Settings (Pydantic, BEAM_VALIDATOR_ prefix)
+│       │   ├── _beam_stubs.py     # Stubs for beam.* modules
+│       │   └── redundancy.py      # Failover/recovery
+│       ├── chain/           # Bittensor chain interface, tx verification
+│       ├── clients/         # BeamCore API client
+│       └── services/        # Weight calculation, cross-verification
+├── config/                  # YAML configs (defaults, testnet, mainnet, local)
+└── docs/                    # Orchestrator & validator guides
+```
+
+## Key Concepts
+
+- **BeamCore** is the central coordination API (external, not in this repo). Both neurons communicate with it via REST clients in `clients/subnet_core_client.py`.
+- **Orchestrators** register with BeamCore, poll for chunk assignments, distribute tasks to workers via WebSocket, aggregate Proof-of-Bandwidth, and handle worker payments.
+- **Validators** fetch metrics from BeamCore, compute SLA scores (bandwidth 50%, uptime 20%, loss 15%, tier 15%), and set weights on the Bittensor chain.
+- **Workers** are off-chain, managed by orchestrators - they execute the actual data transfers.
+- Payment proofs use Merkle trees (`neurons/shared/merkle.py`) with on-chain tx_hash format `{extrinsic_hash}:{block_hash}`.
+
+## Configuration
+
+- **Orchestrator** env vars have no prefix (e.g., `WALLET_NAME`, `NETUID`, `SUBNET_CORE_URL`)
+- **Validator** env vars use `BEAM_VALIDATOR_` prefix (e.g., `BEAM_VALIDATOR_WALLET_NAME`)
+- Both use Pydantic Settings with validation aliases; see `.env.example` for all options
+- YAML config hierarchy: `config/defaults.yaml` < `config/{testnet,mainnet,local}.yaml` < env vars
+- Networks: testnet (subnet 304, `test`) and mainnet (subnet 105, `finney`)
+- `LOCAL_MODE=true` skips Bittensor wallet/subtensor initialization for dev
+
+## Code Style
+
+- Python 3.11+, async-first (asyncio, aiohttp, httpx)
+- Black formatter, line length 100
+- Ruff linter with E, F, I, W rules (E501 line-length ignored)
+- Pydantic v2 for config and data models
+- FastAPI for HTTP endpoints

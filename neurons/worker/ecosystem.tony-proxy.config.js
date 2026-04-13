@@ -1,8 +1,7 @@
 const GEN01_HOTKEY = "5Ef43doHxGJEZbGif5h6Je1s5UoVSCpfhfbkUeBG4Vjca6gh";
 
-
 const workers = [];
-for (let i = 1; i <= 20; i++) {
+for (let i = 81; i <= 95; i++) {
   const id = String(i).padStart(3, '0');
   workers.push({
     name: `tony-w${id}`,
@@ -14,7 +13,8 @@ for (let i = 1; i <= 20; i++) {
       SUBNET_CORE_URL: 'https://beamcore.b1m.ai',
       BEAM_ORCHESTRATOR_HOTKEYS: GEN01_HOTKEY,
       BEAM_WORKER_REGION: 'US',
-      BEAM_ORCHESTRATOR_API_KEY: 'b1m_ef1e0bd3d7be2588e635a8847ddc044e19cb6cdc1d2d8a42',
+      BEAM_ORCHESTRATOR_API_KEY: 'b1m_b720ce026090d5f975821c1d8be8ea3e38dc362553bfcb6d',
+      BEAM_WORKER_PROXY: 'socks5://vadanamihai409:im5PBXYYST@95.164.207.146:59101',
     }
   });
 }

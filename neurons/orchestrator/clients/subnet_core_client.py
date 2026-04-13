@@ -1669,6 +1669,26 @@ class SubnetCoreClient:
             logger.error(f"Error getting worker: {e}")
             raise
 
+    async def get_worker_coldkey(self, worker_id: str) -> Optional[str]:
+        """
+        Resolve a worker_id to its coldkey via BeamCore.
+
+        Uses GET /orchestrators/workers/{id}/coldkey — returns the on-chain
+        coldkey needed for transfer_stake payments without metagraph lookup.
+        """
+        client = await self._get_client()
+
+        try:
+            response = await client.get(
+                f"{self.base_url}/orchestrators/workers/{worker_id}/coldkey",
+            )
+            response.raise_for_status()
+            data = response.json()
+            return data.get("coldkey")
+        except Exception as e:
+            logger.debug(f"Coldkey lookup failed for {worker_id[:16]}...: {e}")
+            return None
+
     async def get_worker_hotkey(self, worker_id: str) -> Optional[str]:
         """
         Resolve a worker_id to its hotkey regardless of affiliation.

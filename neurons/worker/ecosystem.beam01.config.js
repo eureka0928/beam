@@ -1,8 +1,7 @@
-const GEN01_HOTKEY = "5Ef43doHxGJEZbGif5h6Je1s5UoVSCpfhfbkUeBG4Vjca6gh";
-
+const BEAM01_HOTKEY = "5ES591VqvYbsFL7q1rLaPT225CrwDtMKptV3UUrQBLRttzxC";
 
 const workers = [];
-for (let i = 1; i <= 20; i++) {
+for (let i = 81; i <= 120; i++) {
   const id = String(i).padStart(3, '0');
   workers.push({
     name: `tony-w${id}`,
@@ -12,9 +11,11 @@ for (let i = 1; i <= 20; i++) {
     args: `--wallet.name tony --wallet.hotkey tony-${id} --subtensor.network finney`,
     env: {
       SUBNET_CORE_URL: 'https://beamcore.b1m.ai',
-      BEAM_ORCHESTRATOR_HOTKEYS: GEN01_HOTKEY,
+      BEAM_ORCHESTRATOR_HOTKEYS: BEAM01_HOTKEY,
       BEAM_WORKER_REGION: 'US',
-      BEAM_ORCHESTRATOR_API_KEY: 'b1m_ef1e0bd3d7be2588e635a8847ddc044e19cb6cdc1d2d8a42',
+      BEAM_ORCHESTRATOR_API_KEY: 'b1m_80bf8b9086f3f80d13bf119e4a6e059682092a0e2441e0a1',
+      CONNECTION_MODE: 'http',
+      BEAM_WORKER_PROXY: 'socks5://vadanamihai409:im5PBXYYST@185.228.195.218:59101',
     }
   });
 }
