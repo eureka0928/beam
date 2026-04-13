@@ -2,6 +2,7 @@
 Reward Manager - Worker payments, retry queue, and reward distribution.
 """
 
+import asyncio
 import logging
 import time
 from typing import Any, Dict, List, Optional, Set
@@ -69,6 +70,14 @@ class RewardManager:
 
         # Dedup: task IDs that have already been paid (prevents double-payment)
         self._paid_task_ids: Set[str] = set()
+
+        # Coldkey cache: hotkey -> coldkey (avoids repeated metagraph loads)
+        self._coldkey_cache: Dict[str, str] = {}
+        self._coldkey_cache_ts: float = 0.0
+        self._coldkey_cache_ttl: float = 300.0  # Refresh metagraph every 5 min
+
+        # Failed PoB recordings that need retry
+        self._pob_recording_queue: List[Dict[str, Any]] = []
 
         # Reward tracking
         self.total_rewards_distributed: float = 0.0
@@ -225,7 +234,7 @@ class RewardManager:
                         f"Failed to resolve payment address from SubnetCore for task "
                         f"{proof.task_id[:16]}...: {e} — queuing for retry"
                     )
-                    self._queue_failed_payment(worker, proof, reward)
+                    self._queue_failed_payment(worker, proof, alpha_per_chunk, transfer_id=transfer_id)
                     self.last_emission_check = current_emission
                     return None
         else:
@@ -241,7 +250,7 @@ class RewardManager:
                     f"SubnetCore client not available and no worker_hotkey — "
                     f"cannot resolve payment address. Queuing payment for retry."
                 )
-                self._queue_failed_payment(worker, proof, reward)
+                self._queue_failed_payment(worker, proof, alpha_per_chunk, transfer_id=transfer_id)
                 self.last_emission_check = current_emission
                 return None
 
@@ -265,7 +274,7 @@ class RewardManager:
                     logger.error(
                         f"Cannot pay ALPHA: failed to resolve coldkey for worker {worker_hotkey[:16]}..."
                     )
-                    self._queue_failed_payment(worker, proof, reward)
+                    self._queue_failed_payment(worker, proof, alpha_per_chunk, transfer_id=transfer_id)
                     self.last_emission_check = current_emission
                     return None
 
@@ -287,15 +296,35 @@ class RewardManager:
                     transfer_success = True
                     self._payment_success_count += 1
                     # Record payment on PoB record via BeamCore
+                    # CRITICAL: If this fails, BeamCore thinks we didn't pay → compliance penalty
                     if SUBNET_CORE_CLIENT_AVAILABLE and subnet_core_client:
-                        try:
-                            await subnet_core_client.record_pob_payment(
-                                task_id=proof.task_id,
-                                tx_hash=tx_hash,
-                                amount_rao=alpha_amount_rao,
+                        recorded = False
+                        for attempt in range(3):
+                            try:
+                                await subnet_core_client.record_pob_payment(
+                                    task_id=proof.task_id,
+                                    tx_hash=tx_hash,
+                                    amount_rao=alpha_amount_rao,
+                                )
+                                recorded = True
+                                break
+                            except Exception as e:
+                                logger.warning(f"Failed to record PoB payment (attempt {attempt+1}/3): {e}")
+                                if attempt < 2:
+                                    await asyncio.sleep(2)
+                        if not recorded:
+                            # Queue for background retry so we don't lose the record
+                            self._pob_recording_queue.append({
+                                "task_id": proof.task_id,
+                                "tx_hash": tx_hash,
+                                "amount_rao": alpha_amount_rao,
+                                "attempts": 3,
+                                "queued_at": time.time(),
+                            })
+                            logger.error(
+                                f"PoB payment recording FAILED after 3 attempts for task "
+                                f"{proof.task_id[:16]}... — queued for background retry"
                             )
-                        except Exception as e:
-                            logger.warning(f"Failed to record PoB payment: {e}")
                     logger.info(
                         f"ALPHA payment SUCCESS: {alpha_per_chunk} ALPHA to {worker_coldkey[:16]}... "
                         f"transfer={transfer_id} tx={tx_hash[:24]}..."
@@ -305,12 +334,12 @@ class RewardManager:
                     logger.error(
                         f"ALPHA payment FAILED for task {proof.task_id[:16]}... — queuing for retry"
                     )
-                    self._queue_failed_payment(worker, proof, reward)
+                    self._queue_failed_payment(worker, proof, alpha_per_chunk, transfer_id=transfer_id)
 
             except Exception as e:
                 self._payment_failure_count += 1
                 logger.error(f"Error in ALPHA payment: {e}", exc_info=True)
-                self._queue_failed_payment(worker, proof, reward)
+                self._queue_failed_payment(worker, proof, alpha_per_chunk, transfer_id=transfer_id)
 
         # Note: TAO fallback removed - ALPHA payments are mandatory
         else:
@@ -320,20 +349,22 @@ class RewardManager:
                 logger.warning("Cannot pay ALPHA: no wallet available")
             if not subtensor:
                 logger.warning("Cannot pay ALPHA: no subtensor connection")
-            self._queue_failed_payment(worker, proof, alpha_per_chunk)
+            self._queue_failed_payment(worker, proof, alpha_per_chunk, transfer_id=transfer_id)
             return None
 
         self.last_emission_check = current_emission
 
-        reward_nano = int(reward * 1e9)
+        # Use actual on-chain payment amount for all records, not emission-based dust
+        # alpha_amount_rao is the real amount transferred via transfer_stake
+        actual_payment_rao = alpha_amount_rao if transfer_success else 0
 
         if transfer_success:
             self._paid_task_ids.add(proof.task_id)
             # Update worker stats only if worker object exists (not in challenge flow)
             if worker is not None:
-                worker.rewards_earned_epoch += reward_nano
-                worker.rewards_earned_total += reward_nano
-            self.total_rewards_distributed += reward
+                worker.rewards_earned_epoch += actual_payment_rao
+                worker.rewards_earned_total += actual_payment_rao
+            self.total_rewards_distributed += alpha_per_chunk
 
             if DB_AVAILABLE and db:
                 try:
@@ -343,7 +374,7 @@ class RewardManager:
                         worker_hotkey=worker_hotkey,
                         bytes_relayed=proof.bytes_relayed,
                         tasks_completed=1,
-                        amount_earned=reward_nano,
+                        amount_earned=actual_payment_rao,
                         merkle_proof=tx_hash,
                         leaf_index=0,
                     )
@@ -360,7 +391,7 @@ class RewardManager:
                         worker_hotkey=worker_hotkey,
                         bytes_relayed=proof.bytes_relayed,
                         tasks_completed=1,
-                        amount_earned=reward_nano,
+                        amount_earned=actual_payment_rao,
                         task_id=proof.task_id,
                         tx_hash=tx_hash,
                     )
@@ -369,19 +400,12 @@ class RewardManager:
                 except Exception as e:
                     logger.warning(f"Failed to record payment via SubnetCore: {e}")
 
-            # Update epoch summary
-            self._track_epoch_payment(current_epoch, worker_id, worker_hotkey, reward_nano, proof.bytes_relayed)
+            # Update epoch summary with actual payment amount
+            self._track_epoch_payment(current_epoch, worker_id, worker_hotkey, actual_payment_rao, proof.bytes_relayed)
             await self._report_epoch_summary(current_epoch, hotkey, subnet_core_client)
 
-            # Immediately acknowledge task completion after successful payment
-            # This ensures tasks are marked as acknowledged without waiting for the next poll cycle
-            if SUBNET_CORE_CLIENT_AVAILABLE and subnet_core_client and proof.task_id:
-                try:
-                    await subnet_core_client.acknowledge_task_completions([proof.task_id], verified=True)
-                    logger.debug(f"Immediately acknowledged task {proof.task_id[:16]}... after payment")
-                except Exception as e:
-                    # Don't fail the payment if ack fails - it will be retried on next poll
-                    logger.warning(f"Failed to immediately acknowledge task {proof.task_id[:16]}...: {e}")
+            # Note: acknowledge is handled by the WS client after _handle_task_completion_notification
+            # returns True. No need to call it again here — double-acknowledge is harmless but wasteful.
 
         status = "PAID" if transfer_success else "QUEUED FOR RETRY"
         logger.info(
@@ -390,7 +414,7 @@ class RewardManager:
             f"(transfer={transfer_id})"
         )
 
-        return reward if transfer_success else None
+        return alpha_per_chunk if transfer_success else None
 
     def _track_epoch_payment(self, epoch: int, worker_id: str, worker_hotkey: str, amount_nano: int, bytes_relayed: int):
         """Accumulate payment totals and leaf data for an epoch."""
@@ -437,13 +461,14 @@ class RewardManager:
         except Exception as e:
             logger.error(f"[MERKLE] Failed to report epoch summary: {e}", exc_info=True)
 
-    def _queue_failed_payment(self, worker, proof, reward_tao: float):
+    def _queue_failed_payment(self, worker, proof, reward_tao: float, transfer_id: str = None):
         """Queue a failed/partial payment for retry when balance is available."""
         # Use proof attributes (always available) since worker may be None
         self._payment_retry_queue.append({
             "worker_hotkey": proof.worker_hotkey,
             "worker_id": proof.worker_id,
             "task_id": proof.task_id,
+            "transfer_id": transfer_id,
             "proof": proof,
             "reward_tao": reward_tao,
             "attempts": 0,
@@ -459,16 +484,27 @@ class RewardManager:
         if not self._payment_retry_queue or not wallet or not subtensor:
             return
 
+        # transfer_stake uses staked ALPHA, not free TAO balance.
+        # Check staked alpha on our hotkey for the subnet.
         try:
-            balance = subtensor.get_balance(wallet.hotkey.ss58_address)
-            available = float(balance) - 0.001
-        except Exception as e:
-            logger.warning(f"Could not check balance for retry queue: {e}")
-            return
+            stake_info = subtensor.get_stake(
+                coldkey_ss58=wallet.coldkey.ss58_address,
+                hotkey_ss58=wallet.hotkey.ss58_address,
+                netuid=105,
+            )
+            available = float(stake_info) - 0.1  # Keep 0.1 ALPHA buffer
+        except Exception:
+            # Fallback: try TAO balance as a rough proxy
+            try:
+                balance = subtensor.get_balance(wallet.hotkey.ss58_address)
+                available = float(balance) - 0.001
+            except Exception as e:
+                logger.warning(f"Could not check balance for retry queue: {e}")
+                return
 
         if available <= 0:
             logger.debug(
-                f"No balance for payment retries ({len(self._payment_retry_queue)} queued)"
+                f"Insufficient staked ALPHA for payment retries ({len(self._payment_retry_queue)} queued)"
             )
             return
 
@@ -540,8 +576,25 @@ class RewardManager:
                     continue
 
                 # ALPHA payment via transfer_stake with on-chain memo
-                alpha_amount = reward if reward > 0.0005 else 0.0005
-                payment_memo = f"retry:{task_id}"
+                # Memo format must be {transfer_id}:{task_id} per BeamCore spec
+                # Always pay alpha_per_chunk (0.5 ALPHA) — not the dust emission reward
+                alpha_per_chunk = self.settings.alpha_per_chunk if hasattr(self.settings, 'alpha_per_chunk') else 0.5
+                alpha_amount = alpha_per_chunk
+                retry_transfer_id = item.get("transfer_id")
+                if not retry_transfer_id and SUBNET_CORE_CLIENT_AVAILABLE and subnet_core_client and task_id:
+                    try:
+                        validation = await subnet_core_client.validate_transfer_for_payment(task_id)
+                        retry_transfer_id = validation.get("transfer_id") if validation.get("valid") else None
+                    except Exception:
+                        pass
+                if not retry_transfer_id:
+                    item["attempts"] += 1
+                    logger.warning(
+                        f"Retry: cannot resolve transfer_id for task {task_id[:16]}... "
+                        f"(attempt {item['attempts']}/{self._max_payment_retries})"
+                    )
+                    continue
+                payment_memo = f"{retry_transfer_id}:{task_id}"
                 tx_hash = await self.transfer_alpha_with_memo(
                     worker_coldkey=worker_coldkey,
                     amount_alpha=alpha_amount,
@@ -560,19 +613,33 @@ class RewardManager:
                     )
 
                     # Record payment on PoB record via BeamCore
+                    # CRITICAL: failure here means BeamCore thinks we didn't pay
                     alpha_amount_rao = int(alpha_amount * 1e9)
                     if SUBNET_CORE_CLIENT_AVAILABLE and subnet_core_client:
-                        try:
-                            await subnet_core_client.record_pob_payment(
-                                task_id=task_id,
-                                tx_hash=tx_hash,
-                                amount_rao=alpha_amount_rao,
-                            )
-                        except Exception as e:
-                            logger.warning(f"Failed to record retry PoB payment: {e}")
+                        recorded = False
+                        for rec_attempt in range(3):
+                            try:
+                                await subnet_core_client.record_pob_payment(
+                                    task_id=task_id,
+                                    tx_hash=tx_hash,
+                                    amount_rao=alpha_amount_rao,
+                                )
+                                recorded = True
+                                break
+                            except Exception as e:
+                                logger.warning(f"Failed to record retry PoB payment (attempt {rec_attempt+1}/3): {e}")
+                                if rec_attempt < 2:
+                                    await asyncio.sleep(2)
+                        if not recorded:
+                            self._pob_recording_queue.append({
+                                "task_id": task_id,
+                                "tx_hash": tx_hash,
+                                "amount_rao": alpha_amount_rao,
+                                "attempts": 3,
+                                "queued_at": time.time(),
+                            })
 
                     proof = item["proof"]
-                    reward_nano = int(reward * 1e9)
 
                     if DB_AVAILABLE and db:
                         try:
@@ -582,7 +649,7 @@ class RewardManager:
                                 worker_hotkey=item["worker_hotkey"],
                                 bytes_relayed=proof.bytes_relayed,
                                 tasks_completed=1,
-                                amount_earned=reward_nano,
+                                amount_earned=alpha_amount_rao,
                                 merkle_proof=tx_hash,
                                 leaf_index=0,
                             )
@@ -599,7 +666,7 @@ class RewardManager:
                                 worker_hotkey=item["worker_hotkey"],
                                 bytes_relayed=proof.bytes_relayed,
                                 tasks_completed=1,
-                                amount_earned=reward_nano,
+                                amount_earned=alpha_amount_rao,
                                 task_id=proof.task_id,
                                 tx_hash=tx_hash,
                             )
@@ -607,8 +674,8 @@ class RewardManager:
                         except Exception as e:
                             logger.warning(f"Failed to record retry payment via SubnetCore: {e}")
 
-                    self._track_epoch_payment(current_epoch, item["worker_id"], item["worker_hotkey"], reward_nano, proof.bytes_relayed)
-                    self.total_rewards_distributed += reward
+                    self._track_epoch_payment(current_epoch, item["worker_id"], item["worker_hotkey"], alpha_amount_rao, proof.bytes_relayed)
+                    self.total_rewards_distributed += alpha_amount
                     completed.add(i)
                 else:
                     item["attempts"] += 1
@@ -644,6 +711,42 @@ class RewardManager:
                 f"Retry queue: {len(completed)} paid, {len(expired)} expired, "
                 f"{len(self._payment_retry_queue)} remaining"
             )
+
+    async def process_pob_recording_queue(self, subnet_core_client):
+        """Retry failed PoB payment recordings. Called periodically.
+
+        If record_pob_payment fails, BeamCore doesn't know we paid on-chain,
+        so the proof appears unpaid → 5% compliance penalty per proof.
+        """
+        if not self._pob_recording_queue or not SUBNET_CORE_CLIENT_AVAILABLE or not subnet_core_client:
+            return
+
+        completed = []
+        for i, item in enumerate(self._pob_recording_queue):
+            try:
+                await subnet_core_client.record_pob_payment(
+                    task_id=item["task_id"],
+                    tx_hash=item["tx_hash"],
+                    amount_rao=item["amount_rao"],
+                )
+                completed.append(i)
+                logger.info(f"PoB recording retry SUCCESS for task {item['task_id'][:16]}...")
+            except Exception as e:
+                item["attempts"] += 1
+                if item["attempts"] >= 10:
+                    completed.append(i)
+                    logger.error(
+                        f"PoB recording ABANDONED after {item['attempts']} attempts "
+                        f"for task {item['task_id'][:16]}... — compliance will be penalized"
+                    )
+                else:
+                    logger.debug(f"PoB recording retry failed ({item['attempts']}/10): {e}")
+
+        if completed:
+            self._pob_recording_queue = [
+                item for i, item in enumerate(self._pob_recording_queue)
+                if i not in completed
+            ]
 
     # =========================================================================
     # ALPHA Token Transfer with On-Chain Memo
@@ -757,27 +860,35 @@ class RewardManager:
         netuid: int,
     ) -> Optional[str]:
         """
-        Resolve a worker's hotkey to their coldkey via metagraph.
+        Resolve a worker's hotkey to their coldkey via cached metagraph.
 
-        Args:
-            worker_hotkey: Worker's hotkey address
-            subtensor: Subtensor connection
-            netuid: Network UID
-
-        Returns:
-            Worker's coldkey address, or None if not found
+        Caches the entire hotkey->coldkey mapping to avoid loading metagraph
+        on every payment call. Cache refreshes every 5 minutes.
         """
-        try:
-            metagraph = subtensor.metagraph(netuid)
-            for neuron in metagraph.neurons:
-                if neuron.hotkey == worker_hotkey:
-                    logger.debug(f"Resolved coldkey for {worker_hotkey[:16]}...: {neuron.coldkey[:16]}...")
-                    return neuron.coldkey
-            logger.warning(f"Worker hotkey {worker_hotkey[:16]}... not found in metagraph")
-            return None
-        except Exception as e:
-            logger.error(f"Failed to resolve coldkey for {worker_hotkey[:16]}...: {e}")
-            return None
+        # Check cache first
+        if worker_hotkey in self._coldkey_cache:
+            return self._coldkey_cache[worker_hotkey]
+
+        # Refresh cache if stale
+        now = time.time()
+        if now - self._coldkey_cache_ts > self._coldkey_cache_ttl:
+            try:
+                metagraph = subtensor.metagraph(netuid)
+                self._coldkey_cache = {}
+                for neuron in metagraph.neurons:
+                    self._coldkey_cache[neuron.hotkey] = neuron.coldkey
+                self._coldkey_cache_ts = now
+                logger.info(f"Refreshed coldkey cache: {len(self._coldkey_cache)} entries")
+            except Exception as e:
+                logger.error(f"Failed to refresh coldkey cache: {e}")
+
+        # Lookup after refresh
+        coldkey = self._coldkey_cache.get(worker_hotkey)
+        if coldkey:
+            logger.debug(f"Resolved coldkey for {worker_hotkey[:16]}...: {coldkey[:16]}...")
+        else:
+            logger.warning(f"Worker hotkey {worker_hotkey[:16]}... not found in metagraph cache")
+        return coldkey
 
     def _calculate_quality_multiplier(self, worker) -> float:
         """

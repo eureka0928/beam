@@ -1208,6 +1208,9 @@ class Orchestrator:
                         self._accepting_tasks = True
                         logger.info("Retry payments succeeded — resuming task acceptance.")
 
+                # Retry failed PoB recordings (critical for compliance)
+                await self._reward_mgr.process_pob_recording_queue(self.subnet_core_client)
+
                 # Re-sync epoch from chain periodically (every 10 min) to correct drift
                 now = time.time()
                 if now - last_chain_sync >= chain_sync_interval:
@@ -1308,7 +1311,7 @@ class Orchestrator:
         """Handle stale task notification pushed via WebSocket from BeamCore.
 
         Selects an alternative worker and reassigns the task.
-        Reuses the same selection/reassignment logic as the polling loop.
+        Uses local worker cache first (reliable), falls back to API.
         """
         task_id = data.get("task_id")
         original_worker_id = data.get("worker_id")
@@ -1320,12 +1323,26 @@ class Orchestrator:
         logger.info(f"Stale task notification: {task_id[:16]}... (worker={worker_short})")
 
         try:
-            workers_response = await self.subnet_core_client.list_workers(status="active")
-            all_workers = workers_response.get("workers", [])
+            # Use local worker cache (same as transfer handler) — much faster and
+            # more reliable than API which can return empty
+            available_workers = [
+                {
+                    "worker_id": w.worker_id,
+                    "trust_score": w.trust_score,
+                    "success_rate": w.success_rate,
+                    "bandwidth_mbps": w.bandwidth_ema,
+                }
+                for w in self.workers.values()
+                if w.status != WorkerStatus.OFFLINE
+            ]
 
-            available_workers = self._filter_workers_with_recent_heartbeat(
-                all_workers, max_age_seconds=60
-            )
+            # Fallback to API only if local cache is empty
+            if not available_workers and self.subnet_core_client:
+                try:
+                    resp = await self.subnet_core_client.list_workers(status="active")
+                    available_workers = resp.get("workers", [])
+                except Exception:
+                    pass
 
             if not available_workers:
                 logger.warning(f"No workers available for stale task {task_id[:16]}...")
