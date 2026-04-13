@@ -27,7 +27,8 @@ module.exports = {
       MAX_CONCURRENT_TASKS: '1000',
       TASK_TIMEOUT: '120',
       ALPHA_PER_CHUNK: '0.5',
-      BEAMCORE_API_KEY: 'b1m_80bf8b9086f3f80d13bf119e4a6e059682092a0e2441e0a1',
+      READY: 'true',
+      BEAMCORE_API_KEY: 'b1m_7463add7fa36d7ed61f02693796de9dd06af5517209ad9e9',
     }
   }]
 };

@@ -13,7 +13,7 @@ for (let i = 81; i <= 120; i++) {
       SUBNET_CORE_URL: 'https://beamcore.b1m.ai',
       BEAM_ORCHESTRATOR_HOTKEYS: BEAM01_HOTKEY,
       BEAM_WORKER_REGION: 'US',
-      BEAM_ORCHESTRATOR_API_KEY: 'b1m_80bf8b9086f3f80d13bf119e4a6e059682092a0e2441e0a1',
+      BEAM_ORCHESTRATOR_API_KEY: 'b1m_7463add7fa36d7ed61f02693796de9dd06af5517209ad9e9',
       CONNECTION_MODE: 'http',
       BEAM_WORKER_PROXY: 'socks5://vadanamihai409:im5PBXYYST@185.228.195.218:59101',
     }
