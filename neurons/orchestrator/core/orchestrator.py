@@ -940,6 +940,21 @@ class Orchestrator:
         # Generate valid canary_proof (validator rejects if len != 64 hex chars)
         relay_canary = _generate_canary_proof()
 
+        # Resolve chunk_hash: prefer transfer_id from proof, fall back to BeamCore lookup
+        chunk_hash = (
+            proof_of_bandwidth.get("transfer_id", "")
+            or proof_of_bandwidth.get("chunk_hash", "")
+        )
+        if not chunk_hash and task_id and self.subnet_core_client:
+            try:
+                task_details = await self.subnet_core_client.get_task(task_id)
+                chunk_hash = task_details.get("chunk_hash", "")
+            except Exception as e:
+                logger.warning(f"Failed to fetch chunk_hash for relay {task_id[:16]}...: {e}")
+        if not chunk_hash:
+            logger.error(f"No chunk_hash for relay {task_id[:16]}... — skipping proof")
+            return None
+
         proof = BandwidthProof(
             task_id=task_id or f"relay-{worker_id}-{int(time.time())}",
             worker_id=worker_id,
@@ -948,7 +963,7 @@ class Orchestrator:
             end_time_us=end_time_us,
             bytes_relayed=bytes_relayed,
             bandwidth_mbps=bandwidth_mbps,
-            chunk_hash=proof_of_bandwidth.get("transfer_id", ""),
+            chunk_hash=chunk_hash,
             canary_proof=relay_canary,
             worker_signature=proof_of_bandwidth.get("signature", ""),
             source_region=worker_region or "unknown",
@@ -1778,6 +1793,23 @@ class Orchestrator:
                 end_time_us = message.get("end_time_us", 0)
                 chunk_hash = message.get("chunk_hash", "")
 
+                # Fetch chunk_hash from BeamCore if missing (critical for PoB publish)
+                if not chunk_hash and not (task and task.chunk_hash):
+                    if self.subnet_core_client:
+                        try:
+                            task_details = await self.subnet_core_client.get_task(task_id)
+                            chunk_hash = task_details.get("chunk_hash", "")
+                        except Exception as e:
+                            logger.warning(
+                                f"Failed to fetch chunk_hash for task {task_id[:16]}...: {e}"
+                            )
+                    if not chunk_hash:
+                        logger.error(
+                            f"No chunk_hash for task {task_id[:16]}... — skipping proof "
+                            f"(would be rejected by BeamCore)"
+                        )
+                        return False
+
                 if not end_time_us:
                     end_time_us = int(time.time() * 1_000_000)
                 if not start_time_us:
@@ -1911,20 +1943,25 @@ class Orchestrator:
 
         # Fall back to API if cache is empty (e.g. first transfer before initial sync)
         if not workers and self.subnet_core_client:
-            try:
-                resp = await self.subnet_core_client.list_workers(status="active")
-                workers = resp.get("workers", [])
-                logger.info(f"Cache empty, fetched {len(workers)} workers from API")
-            except Exception as e:
-                logger.error(f"Failed to list workers for transfer {transfer_id[:16]}...: {e}")
-                return
+            for attempt in range(3):
+                try:
+                    resp = await self.subnet_core_client.list_workers(status="active")
+                    workers = resp.get("workers", [])
+                    if workers:
+                        logger.info(f"Cache empty, fetched {len(workers)} workers from API (attempt {attempt+1})")
+                        break
+                    logger.warning(f"API returned 0 workers for transfer {transfer_id[:16]}... (attempt {attempt+1}/3)")
+                except Exception as e:
+                    logger.error(f"Failed to list workers for transfer {transfer_id[:16]}... (attempt {attempt+1}/3): {e}")
+                if attempt < 2:
+                    await asyncio.sleep(2)
 
         _t_workers = (time.monotonic() - _t0) * 1000
         if workers:
             logger.info(f"Got {len(workers)} workers for transfer {transfer_id[:16]}... ({_t_workers:.0f}ms)")
 
         if not workers:
-            logger.warning(f"No active workers available for transfer {transfer_id[:16]}...")
+            logger.error(f"CRITICAL: No workers available for transfer {transfer_id[:16]}... — transfer dropped")
             return
 
         # Assign chunks to workers (round-robin) - only for this orchestrator's range
@@ -1946,21 +1983,34 @@ class Orchestrator:
             total_size = sum(c.get("size", 0) for c in chunks) if chunks else 0
         chunk_size = chunks[0].get("size", 4 * 1024 * 1024) if chunks else 4 * 1024 * 1024
 
-        # POST assignments to SubnetCore
-        try:
-            result = await self.subnet_core_client.post_chunk_assignments(
-                transfer_id=transfer_id,
-                gateway_url=gateway_url,
-                object_id=object_id,
-                destination_url=destination_url,
-                total_size=total_size,
-                chunk_size=chunk_size,
-                assignments=assignments,
-                auth_token=auth_token,
-                source_urls=source_urls,
-                dest_urls=dest_urls,
-            )
+        # POST assignments to SubnetCore (retry on failure — losing a transfer is costly)
+        result = None
+        for attempt in range(3):
+            try:
+                result = await self.subnet_core_client.post_chunk_assignments(
+                    transfer_id=transfer_id,
+                    gateway_url=gateway_url,
+                    object_id=object_id,
+                    destination_url=destination_url,
+                    total_size=total_size,
+                    chunk_size=chunk_size,
+                    assignments=assignments,
+                    auth_token=auth_token,
+                    source_urls=source_urls,
+                    dest_urls=dest_urls,
+                )
+                break
+            except Exception as e:
+                logger.warning(f"Assignment POST failed (attempt {attempt+1}/3): {e}")
+                if attempt < 2:
+                    await asyncio.sleep(1)
 
+        if not result:
+            _elapsed_ms = (time.monotonic() - _t0) * 1000
+            logger.error(f"CRITICAL: Failed to post assignments for transfer {transfer_id[:16]}... after 3 attempts ({_elapsed_ms:.0f}ms)")
+            return
+
+        try:
             created = result.get('tasks_created', result.get('created_count', 0))
             pushed = result.get('tasks_pushed', 0)
             already_assigned = result.get('already_assigned_count', 0)
@@ -2007,8 +2057,7 @@ class Orchestrator:
                 )
 
         except Exception as e:
-            _elapsed_ms = (time.monotonic() - _t0) * 1000
-            logger.error(f"Failed to post assignments for transfer {transfer_id[:16]}... ({_elapsed_ms:.0f}ms): {e}")
+            logger.error(f"Error processing assignment result for transfer {transfer_id[:16]}...: {e}")
 
     def _assign_chunks_to_workers(
         self,

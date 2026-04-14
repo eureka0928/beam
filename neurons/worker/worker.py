@@ -363,12 +363,26 @@ async def poll_worker_tasks(client: httpx.AsyncClient, state: WorkerState) -> Li
 
 
 async def accept_task(client: httpx.AsyncClient, state: WorkerState, task_id: str) -> bool:
-    """Accept a task via HTTP."""
+    """Accept a task via HTTP.
+
+    API requires task_id in body, auth via signature or X-Api-Key.
+    """
     try:
-        headers = {"X-Api-Key": state.api_key} if state.api_key else {}
+        hotkey = state.wallet.hotkey.ss58_address
+        timestamp = str(int(time.time()))
+        signature = sign_message(state.wallet, f"{task_id}:{state.worker_id}:{timestamp}")
+
+        headers = {
+            "X-Hotkey": hotkey,
+            "X-Signature": signature,
+            "X-Timestamp": timestamp,
+        }
+        if state.api_key:
+            headers["X-Api-Key"] = state.api_key
+
         response = await client.post(
             f"{state.api_url}/workers/tasks/accept",
-            params={"task_id": task_id, "worker_id": state.worker_id},
+            json={"task_id": task_id},
             headers=headers,
             timeout=10.0,
         )
@@ -394,8 +408,17 @@ async def complete_task(
     chunk_hash: str = "",
     error: str = None,
 ) -> bool:
-    """Report task completion via HTTP."""
+    """Report task completion via HTTP.
+
+    API requires: task_id, worker_id, success, chunk_hash, hotkey, signature.
+    Signature signs "{task_id}:{worker_id}:{chunk_hash}" with worker hotkey.
+    BeamCore verifies chunk_hash against expected hash (Merkle verification).
+    """
     try:
+        hotkey = state.wallet.hotkey.ss58_address
+        # API requires signature: sign "{task_id}:{worker_id}:{chunk_hash}"
+        signature = sign_message(state.wallet, f"{task_id}:{state.worker_id}:{chunk_hash}")
+
         payload = {
             "task_id": task_id,
             "worker_id": state.worker_id,
@@ -406,28 +429,17 @@ async def complete_task(
             "end_time_us": end_time_us,
             "latency_ms": duration_ms,
             "duration_ms": int(duration_ms),
+            "chunk_hash": chunk_hash,
+            "hotkey": hotkey,
+            "signature": signature,
         }
-        if chunk_hash: payload["chunk_hash"] = chunk_hash
-        if error: payload["error"] = error
-        response = await client.post(
-            f"{state.api_url}/workers/tasks/complete",
-            json=payload,
-            headers={"X-Worker-Hotkey": state.wallet.hotkey.ss58_address},
-            timeout=10.0,
-        )
-        data = response.json()
-        return data.get("success", False)
-    except Exception as e:
-        print(f"[Worker] Complete task error: {e}")
-        return False
-            payload["chunk_hash"] = chunk_hash
         if error:
             payload["error"] = error
 
         response = await client.post(
             f"{state.api_url}/workers/tasks/complete",
             json=payload,
-            headers={"X-Worker-Hotkey": state.wallet.hotkey.ss58_address},
+            headers={"X-Api-Key": state.api_key} if state.api_key else {},
             timeout=10.0,
         )
         data = response.json()
@@ -929,6 +941,9 @@ async def ws_send_task_result(
 ) -> bool:
     """Send task result over WebSocket."""
     try:
+        hotkey = state.wallet.hotkey.ss58_address
+        signature = sign_message(state.wallet, f"{task_id}:{state.worker_id}:{chunk_hash}")
+
         msg = {
             "type": "task_result",
             "task_id": task_id,
@@ -940,9 +955,10 @@ async def ws_send_task_result(
             "end_time_us": end_time_us,
             "latency_ms": duration_ms,
             "duration_ms": int(duration_ms),
+            "chunk_hash": chunk_hash,
+            "hotkey": hotkey,
+            "signature": signature,
         }
-        if chunk_hash:
-            msg["chunk_hash"] = chunk_hash
         if error:
             msg["error"] = error
         await websocket.send(json.dumps(msg))

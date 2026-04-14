@@ -278,7 +278,7 @@ class SubnetCoreClient:
         base_url: str,
         orchestrator_hotkey: str,
         orchestrator_uid: int,
-        timeout: float = 30.0,
+        timeout: float = 60.0,
         signer=None,
     ):
         """
@@ -561,6 +561,13 @@ class SubnetCoreClient:
 
         # Start heartbeat loop (still uses HTTP)
         self._ws_heartbeat_task = asyncio.create_task(self._heartbeat_loop(heartbeat_interval))
+
+        # Poll for completed-but-unpaid tasks (catches task_results WS may miss)
+        # Critical: without this, completed tasks go unpaid → compliance penalty
+        self._results_poll_task = asyncio.create_task(
+            self._results_poll_loop(30.0)
+        )
+
 
         # Keep HTTP connection warm so assignment POSTs don't need TCP+TLS handshake
         self._warmup_task = asyncio.create_task(self._connection_warmup_loop())
@@ -1123,25 +1130,93 @@ class SubnetCoreClient:
             await asyncio.sleep(backoff)
 
     async def _results_poll_loop(self, interval: float):
-        """Poll for pending task results (fallback if WebSocket unavailable)."""
+        """Poll for completed but unpaid tasks — always runs as safety net.
+
+        WS should deliver task_result in real-time, but if it misses any
+        (e.g. BeamCore pushes to wrong buffer, WS reconnect gap), this
+        catches completed tasks and triggers payment before they expire.
+
+        Uses GET /orchestrators/tasks to find completed tasks without PoB.
+        Skips tasks that already failed processing (dedup via _poll_failed_tasks).
+        """
+        self._poll_failed_tasks: set = set()  # Tasks that failed processing — don't retry
+
         while self._running:
-            if not self._ws_connected:
-                try:
-                    results = await self.get_pending_task_results()
-                    for result in results:
+            try:
+                client = await self._get_client()
+                response = await client.get(
+                    f"{self.base_url}/orchestrators/tasks",
+                    params={"limit": 50},
+                )
+                if response.status_code == 200:
+                    data = response.json()
+                    tasks = data if isinstance(data, list) else data.get("tasks", [])
+                    unpaid = [
+                        t for t in tasks
+                        if t.get("status") == "completed"
+                        and not t.get("has_pob")
+                        and t.get("task_id") not in self._poll_failed_tasks
+                    ]
+                    if unpaid:
+                        logger.info(f"Poll found {len(unpaid)} completed unpaid task(s) — triggering payment")
+                    for task in unpaid:
+                        task_id = task.get("task_id", "")
                         if self._task_completion_handler:
                             try:
-                                verified = await self._task_completion_handler(result)
+                                verified = await self._task_completion_handler(task)
                                 if verified:
-                                    task_id = result.get("task_id")
                                     if task_id:
                                         await self.acknowledge_task_completions([task_id])
+                                else:
+                                    # Handler returned False — skip this task in future polls
+                                    self._poll_failed_tasks.add(task_id)
                             except Exception as e:
-                                logger.error(f"Error handling task result: {e}")
-                except Exception as e:
-                    logger.warning(f"Task results poll failed: {e}")
+                                logger.error(f"Error handling polled task {task_id[:16]}...: {e}")
+                                self._poll_failed_tasks.add(task_id)
+            except Exception as e:
+                logger.debug(f"Task results poll failed: {e}")
 
             await asyncio.sleep(interval)
+
+    # =========================================================================
+    # Unified Events Endpoint
+    # =========================================================================
+
+    async def get_events(
+        self,
+        cursor: Optional[str] = None,
+        limit: int = 50,
+        block_ms: int = 0,
+    ) -> Dict[str, Any]:
+        """Poll unified event stream.
+
+        GET /orchestrators/events — replaces pending-transfers, tasks/pending-results,
+        and tasks/stale with a single cursor-based endpoint.
+
+        Event types: transfer_assigned, task_completed, task_stale.
+
+        Args:
+            cursor: Last event ID for cursor-based pagination (None = latest).
+            limit: Max events to return per poll.
+            block_ms: Long-poll timeout (0 = return immediately).
+
+        Returns:
+            Dict with "events" list and "cursor" for next poll.
+        """
+        client = await self._get_client()
+        params: Dict[str, Any] = {"limit": limit}
+        if cursor:
+            params["cursor"] = cursor
+        if block_ms > 0:
+            params["block_ms"] = block_ms
+
+        response = await client.get(
+            f"{self.base_url}/orchestrators/events",
+            params=params,
+            timeout=max(30.0, (block_ms / 1000) + 10),
+        )
+        response.raise_for_status()
+        return response.json()
 
     # =========================================================================
     # HTTP Endpoints
@@ -1322,7 +1397,7 @@ class SubnetCoreClient:
             response = await client.post(
                 f"{self.base_url}/orchestrators/assignments",
                 json=body,
-                timeout=5.0,  # Tight timeout: if it takes longer, the race is lost
+                timeout=30.0,  # Extended: BeamCore DB can be slow under load
             )
             response.raise_for_status()
             return response.json()
@@ -1650,6 +1725,44 @@ class SubnetCoreClient:
         except Exception as e:
             logger.error(f"Error listing workers: {e}")
             raise
+
+    async def list_sla_workers(self, orchestrator_uid: int) -> List[Dict[str, Any]]:
+        """List workers in this orchestrator's SLA pool.
+
+        GET /sla/orchestrators/{uid}/workers
+
+        Returns SLA-affiliated workers that don't appear in /orchestrators/workers.
+        """
+        client = await self._get_client()
+
+        try:
+            response = await client.get(
+                f"{self.base_url}/sla/orchestrators/{orchestrator_uid}/workers",
+            )
+            response.raise_for_status()
+            data = response.json()
+            return data.get("workers", [])
+        except Exception as e:
+            logger.debug(f"SLA worker list failed: {e}")
+            return []
+
+    async def get_worker_id_by_hotkey(self, hotkey: str) -> Optional[str]:
+        """Resolve a worker hotkey to its worker_id.
+
+        Uses GET /sla/workers/{hotkey}/membership which returns worker_id
+        directly from the hotkey (single API call).
+        """
+        client = await self._get_client()
+        try:
+            response = await client.get(
+                f"{self.base_url}/sla/workers/{hotkey}/membership",
+            )
+            response.raise_for_status()
+            data = response.json()
+            return data.get("worker_id")
+        except Exception as e:
+            logger.warning(f"Worker membership lookup failed for {hotkey[:16]}...: {e}")
+            return None
 
     async def get_worker(self, worker_id: str) -> Dict[str, Any]:
         """Get a specific worker (affiliation-scoped)."""
@@ -2012,6 +2125,18 @@ class SubnetCoreClient:
         except Exception as e:
             logger.error(f"Error listing tasks: {e}")
             raise
+
+    async def get_task(self, task_id: str) -> Dict[str, Any]:
+        """Fetch a single task by ID.
+
+        GET /orchestrators/tasks/{task_id}
+        """
+        client = await self._get_client()
+        response = await client.get(
+            f"{self.base_url}/orchestrators/tasks/{task_id}",
+        )
+        response.raise_for_status()
+        return response.json()
 
     async def get_stale_tasks(self, timeout_seconds: int = 30) -> List[Dict[str, Any]]:
         """

@@ -77,29 +77,23 @@ class WorkerManager:
             logger.warning("Max workers limit reached")
             return None
 
-        # Register with SubnetCore to get the canonical worker_id
-        # SubnetCore is the source of truth — it issued the worker_id when
-        # the worker first called POST /workers/register.
+        # Look up worker_id from SubnetCore by hotkey.
+        # Workers self-register via POST /workers/register and self-affiliate
+        # via POST /workers/affiliate. The orchestrator just resolves the
+        # canonical worker_id for internal tracking.
         if subnet_core_client:
             try:
-                from clients.subnet_core_client import WorkerRegistration
-                registration = WorkerRegistration(
-                    hotkey=hotkey,
-                    ip=ip,
-                    port=port,
-                    region=region,
-                )
-                result = await subnet_core_client.register_worker(registration)
-                worker_id = result.get("worker_id")
+                worker_id = await subnet_core_client.get_worker_id_by_hotkey(hotkey)
                 if not worker_id:
                     logger.error(
-                        f"SubnetCore did not return worker_id for {hotkey[:16]}..."
+                        f"Worker {hotkey[:16]}... not registered with SubnetCore "
+                        f"(worker must self-register via POST /workers/register)"
                     )
                     return None
                 logger.info(f"SubnetCore resolved worker_id for {hotkey[:16]}...: {worker_id[:16]}...")
             except Exception as e:
                 logger.error(
-                    f"SubnetCore rejected worker registration for {hotkey[:16]}...: {e}"
+                    f"SubnetCore worker lookup failed for {hotkey[:16]}...: {e}"
                 )
                 return None
         else:
@@ -542,6 +536,32 @@ class WorkerManager:
                     # No hotkey/region indexing since anonymous
 
                 synced += 1
+
+            # Also sync SLA-affiliated workers (separate pool on BeamCore)
+            try:
+                sla_workers = await subnet_core_client.list_sla_workers(subnet_core_client.orchestrator_uid)
+                sla_added = 0
+                for w in sla_workers:
+                    worker_id = w.get("worker_id", "")
+                    if not worker_id or worker_id in self.workers:
+                        continue
+                    worker = Worker(
+                        worker_id=worker_id,
+                        hotkey=w.get("hotkey", ""),
+                        ip="0.0.0.0",
+                        port=0,
+                        region=w.get("region", "unknown"),
+                        bandwidth_mbps=w.get("bandwidth_mbps", 0.0),
+                        status=WorkerStatus.ACTIVE if w.get("status") == "active" else WorkerStatus.OFFLINE,
+                        trust_score=w.get("sla_score", 0.5),
+                        success_rate=w.get("success_rate", 1.0),
+                    )
+                    self.workers[worker_id] = worker
+                    sla_added += 1
+                if sla_added:
+                    logger.info(f"Added {sla_added} SLA workers (total in cache: {len(self.workers)})")
+            except Exception as e:
+                logger.debug(f"SLA worker sync failed: {e}")
 
             logger.info(f"Synced {synced} workers from SubnetCore (total in cache: {len(self.workers)})")
             return synced

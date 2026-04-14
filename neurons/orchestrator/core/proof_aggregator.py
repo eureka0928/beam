@@ -199,7 +199,11 @@ class ProofAggregator:
                 self._failed_publishes.append((pob, 0))
 
     async def _try_publish_pob(self, client, pob, is_retry: bool = False) -> bool:
-        """Attempt to publish a single PoB to SubnetCore. Returns True on success."""
+        """Attempt to publish a single PoB to SubnetCore.
+
+        Returns True on success, False on transient failure (retry later).
+        Returns True on permanent failure (400 Bad Request) to prevent infinite retries.
+        """
         try:
             await client.publish_pob(pob)
             self._publish_success_count += 1
@@ -208,6 +212,11 @@ class ProofAggregator:
             return True
         except Exception as e:
             self._publish_failure_count += 1
+            error_str = str(e)
+            # 400 errors are permanent (hash mismatch, invalid data) — don't retry
+            if "400" in error_str or "Bad Request" in error_str:
+                logger.error(f"PoB publish permanently rejected for {pob.task_id[:16]}...: {e}")
+                return True  # Return True to remove from retry queue
             level = logging.ERROR if self._publish_failure_count > 3 else logging.WARNING
             logger.log(
                 level,
