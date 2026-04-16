@@ -210,26 +210,36 @@ class RewardManager:
         # let it attempt and queue for retry on failure rather than pre-checking
         # the wrong balance type.
 
-        # Resolve payment address from BeamCore payment-address API.
-        # This is the AUTHORITATIVE destination for transfer_stake — BeamCore's
-        # verifier checks on-chain tx destination against this address.
-        # Confirmed working: UID 102 reached compliance=0.50 using this flow.
+        # Resolve worker's actual coldkey for transfer_stake destination.
+        # The verifier checks on-chain transfer_stake destination against the
+        # worker's registered coldkey — NOT the derived payment-address.
+        # Confirmed: UIDs 28, 73, 140 get ⛓ confirmed using worker coldkey.
         payment_dest = None
         if SUBNET_CORE_CLIENT_AVAILABLE and subnet_core_client:
             try:
+                # Step 1: Get worker_id from payment-address API
                 payment_info = await subnet_core_client.get_task_payment_address(proof.task_id)
-                payment_dest = payment_info.get("address")
+                pa_worker_id = payment_info.get("worker_id", "")
+                # Step 2: Resolve actual coldkey from worker_id
+                if pa_worker_id:
+                    payment_dest = await subnet_core_client.get_worker_coldkey(pa_worker_id)
+                if not payment_dest:
+                    # Fallback: try proof.worker_id
+                    payment_dest = await subnet_core_client.get_worker_coldkey(proof.worker_id)
                 if payment_dest:
                     logger.info(
-                        f"Payment address for task {proof.task_id[:16]}...: {payment_dest[:16]}..."
+                        f"Worker coldkey for task {proof.task_id[:16]}...: {payment_dest[:16]}..."
                     )
                 else:
-                    raise ValueError("BeamCore returned empty payment address")
+                    raise ValueError("Cannot resolve worker coldkey")
             except Exception as e:
-                logger.warning(f"Payment address lookup failed for task {proof.task_id[:16]}...: {e}")
+                logger.warning(f"Worker coldkey lookup failed for task {proof.task_id[:16]}...: {e}")
+        # Last resort: try metagraph
+        if not payment_dest:
+            payment_dest = await self._resolve_worker_coldkey(worker_hotkey, subtensor, netuid)
         if not payment_dest:
             logger.error(
-                f"Cannot pay ALPHA: no payment address for task "
+                f"Cannot pay ALPHA: no worker coldkey for task "
                 f"{proof.task_id[:16]}... — queuing for retry"
             )
             self._queue_failed_payment(worker, proof, alpha_per_chunk, transfer_id=transfer_id)
@@ -536,17 +546,19 @@ class RewardManager:
             reward = min(item["reward_tao"], available)
 
             try:
-                # Resolve payment address from BeamCore (authoritative destination)
+                # Resolve worker's actual coldkey for transfer_stake
                 retry_payment_dest = item.get("payment_dest", "")
                 if not retry_payment_dest and SUBNET_CORE_CLIENT_AVAILABLE and subnet_core_client:
                     try:
                         payment_info = await subnet_core_client.get_task_payment_address(task_id)
-                        retry_payment_dest = payment_info.get("address", "")
+                        pa_wid = payment_info.get("worker_id", "")
+                        if pa_wid:
+                            retry_payment_dest = await subnet_core_client.get_worker_coldkey(pa_wid)
                     except Exception as e:
-                        logger.warning(f"Retry: payment address lookup failed for {task_id[:16]}...: {e}")
+                        logger.warning(f"Retry: worker coldkey lookup failed for {task_id[:16]}...: {e}")
                 if not retry_payment_dest:
                     item["attempts"] += 1
-                    logger.warning(f"Retry: cannot resolve payment address for task {task_id[:16]}...")
+                    logger.warning(f"Retry: cannot resolve worker coldkey for task {task_id[:16]}...")
                     continue
 
                 # ALPHA payment via transfer_stake with on-chain memo
