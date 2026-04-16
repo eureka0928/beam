@@ -1651,6 +1651,66 @@ class SubnetCoreClient:
             logger.error(f"Error listing workers: {e}")
             raise
 
+    async def list_sla_workers(self, orchestrator_uid: int) -> List[Dict[str, Any]]:
+        """List workers in this orchestrator's SLA pool.
+
+        GET /sla/orchestrators/{uid}/workers
+
+        Returns SLA-affiliated workers that don't appear in /orchestrators/workers.
+        """
+        client = await self._get_client()
+
+        try:
+            response = await client.get(
+                f"{self.base_url}/sla/orchestrators/{orchestrator_uid}/workers",
+            )
+            response.raise_for_status()
+            data = response.json()
+            return data.get("workers", [])
+        except Exception as e:
+            logger.debug(f"SLA worker list failed: {e}")
+            return []
+
+    async def get_worker_id_by_hotkey(self, hotkey: str) -> Optional[str]:
+        """Resolve a worker hotkey to its worker_id.
+
+        Uses GET /sla/workers/{hotkey}/membership which returns worker_id
+        directly from the hotkey (single API call).
+        """
+        client = await self._get_client()
+        try:
+            response = await client.get(
+                f"{self.base_url}/sla/workers/{hotkey}/membership",
+            )
+            response.raise_for_status()
+            data = response.json()
+            return data.get("worker_id")
+        except Exception as e:
+            logger.warning(f"Worker membership lookup failed for {hotkey[:16]}...: {e}")
+            return None
+
+    async def remove_pool_worker(self, worker_id: str, reason: str = "poor performance") -> bool:
+        """Remove a worker from this orchestrator's pool.
+
+        DELETE /sla/orchestrators/{orchestrator_id}/workers/{worker_id}
+        """
+        client = await self._get_client()
+        try:
+            response = await client.request(
+                "DELETE",
+                f"{self.base_url}/sla/orchestrators/{self.orchestrator_uid}/workers/{worker_id}",
+                json={
+                    "requester_hotkey": self.orchestrator_hotkey,
+                    "reason": reason,
+                },
+            )
+            response.raise_for_status()
+            logger.info(f"Removed worker {worker_id[:16]}... from pool: {reason}")
+            return True
+        except Exception as e:
+            logger.warning(f"Failed to remove worker {worker_id[:16]}...: {e}")
+            return False
+
     async def get_worker(self, worker_id: str) -> Dict[str, Any]:
         """Get a specific worker (affiliation-scoped)."""
         client = await self._get_client()
@@ -2015,6 +2075,25 @@ class SubnetCoreClient:
         except Exception as e:
             logger.error(f"Error listing tasks: {e}")
             raise
+
+    async def get_task(self, task_id: str) -> Dict[str, Any]:
+        """Fetch task details by searching the task list.
+
+        NOTE: GET /orchestrators/tasks/{task_id} does not exist (only PATCH).
+        Falls back to searching the list endpoint.
+        """
+        client = await self._get_client()
+        response = await client.get(
+            f"{self.base_url}/orchestrators/tasks",
+            params={"limit": 100},
+        )
+        response.raise_for_status()
+        data = response.json()
+        tasks = data if isinstance(data, list) else data.get("tasks", [])
+        for t in tasks:
+            if t.get("task_id") == task_id:
+                return t
+        raise ValueError(f"Task {task_id[:16]}... not found in list")
 
     async def get_stale_tasks(self, timeout_seconds: int = 30) -> List[Dict[str, Any]]:
         """
