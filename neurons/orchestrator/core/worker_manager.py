@@ -450,13 +450,13 @@ class WorkerManager:
                 logger.error(f"Error in worker health check: {e}")
 
     async def _check_worker_health(self) -> None:
-        """Check health of all workers."""
+        """Check health of all workers — mark offline if heartbeat stale."""
         from .orchestrator import WorkerStatus
 
         timeout = timedelta(seconds=self.settings.worker_timeout_seconds)
         now = datetime.utcnow()
 
-        for worker in self.workers.values():
+        for worker in list(self.workers.values()):
             if worker.status == WorkerStatus.ACTIVE:
                 is_local = worker.ip in ("127.0.0.1", "localhost", "::1") or worker.region == "local"
                 if is_local:
@@ -500,8 +500,8 @@ class WorkerManager:
             workers_list = workers_data.get("workers", [])
 
             if not workers_list:
-                logger.info("No workers returned from SubnetCore")
-                return 0
+                logger.info("No workers from global pool — checking SLA pool only")
+                workers_list = []  # Continue to SLA sync below
 
             synced = 0
             for w in workers_list:
@@ -542,6 +542,33 @@ class WorkerManager:
                     # No hotkey/region indexing since anonymous
 
                 synced += 1
+
+            # Also sync SLA-affiliated workers (separate pool on BeamCore)
+            try:
+                sla_workers = await subnet_core_client.list_sla_workers(subnet_core_client.orchestrator_uid)
+                sla_added = 0
+                for w in sla_workers:
+                    worker_id = w.get("worker_id", "")
+                    if not worker_id or worker_id in self.workers:
+                        continue
+                    worker = Worker(
+                        worker_id=worker_id,
+                        hotkey=w.get("hotkey", ""),
+                        ip="0.0.0.0",
+                        port=0,
+                        region=w.get("region", "unknown"),
+                        bandwidth_mbps=w.get("bandwidth_mbps", 0.0),
+                        status=WorkerStatus.ACTIVE if w.get("status") == "active" else WorkerStatus.OFFLINE,
+                        trust_score=w.get("sla_score", 0.5),
+                        success_rate=w.get("success_rate", 1.0),
+                        is_affiliated=True,
+                    )
+                    self.workers[worker_id] = worker
+                    sla_added += 1
+                if sla_added:
+                    logger.info(f"Added {sla_added} SLA workers (total in cache: {len(self.workers)})")
+            except Exception as e:
+                logger.debug(f"SLA worker sync failed: {e}")
 
             logger.info(f"Synced {synced} workers from SubnetCore (total in cache: {len(self.workers)})")
             return synced
