@@ -83,6 +83,7 @@ class PoBSubmission:
     canary_proof: Optional[str] = None
     source_region: Optional[str] = None
     dest_region: Optional[str] = None
+    worker_coldkey: Optional[str] = None
 
 
 @dataclass
