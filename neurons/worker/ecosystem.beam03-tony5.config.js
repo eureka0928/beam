@@ -1,5 +1,4 @@
-// 5 tony workers affiliated with beam-03 orchestrator (UID 77)
-// Staggered startup: each worker waits ~10s * index before registering
+// 5 tony workers for beam-03 orchestrator (UID 77) with 15s stagger
 const BEAM03_HOTKEY = '5D82k8jUe87KhhmZdH9z3X8bBQQM6jjRcixhNiNCjnFS1DsP';
 
 const apps = [];
@@ -17,7 +16,7 @@ for (let i = 1; i <= 5; i++) {
       BEAM_ORCHESTRATOR_HOTKEYS: BEAM03_HOTKEY,
       BEAM_WORKER_REGION: 'US',
       BEAM_ORCHESTRATOR_API_KEY: 'b1m_13993002119673ced9f15c66bdb2be06b38a6e9b95ac98a4',
-      BEAM_WORKER_STAGGER: String(i * 10),
+      BEAM_WORKER_STAGGER: String(i * 15),
       CONNECTION_MODE: 'auto',
     }
   });

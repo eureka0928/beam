@@ -23,12 +23,13 @@ module.exports = {
       WORKER_TIMEOUT: '300',
       MIN_WORKER_BANDWIDTH: '10.0',
       WORKER_HEARTBEAT_INTERVAL: '60',
-      WORKER_SYNC_INTERVAL: '60',
+      WORKER_SYNC_INTERVAL: '30',
       MAX_CONCURRENT_TASKS: '1000',
       TASK_TIMEOUT: '120',
       ALPHA_PER_CHUNK: '0.5',
       READY: 'true',
       BEAMCORE_API_KEY: 'b1m_43ce5d13d0440015593bbcc990f124beddeed57b3df92a7e',
+      DATABASE_URL: 'postgresql+asyncpg://beam:beam123@localhost:5432/beam_orchestrator',
     }
   }]
 };
