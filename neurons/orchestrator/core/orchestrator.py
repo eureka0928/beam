@@ -2092,25 +2092,25 @@ class Orchestrator:
         affiliated = [w for w in workers if w.get("is_affiliated")]
         global_pool = [w for w in workers if not w.get("is_affiliated")]
 
-        # Score workers by SLA metrics (higher is better)
-        def worker_sla_score(w: Dict[str, Any]) -> float:
-            trust = float(w.get("trust_score", 0.5))
+        # Score workers — success rate is king (60%), then bandwidth (25%), trust (15%)
+        def worker_score(w: Dict[str, Any]) -> float:
             success = float(w.get("success_rate", 0))
             total_tasks = int(w.get("total_tasks", 0))
             bandwidth = float(w.get("bandwidth_mbps", 0))
-            bw_factor = min(2.0, max(0.1, bandwidth / 100.0))
-            if total_tasks >= 3:
-                success_factor = success / 100.0 if success > 1 else success
-            else:
-                success_factor = 0.3
-            return trust * success_factor * bw_factor
+            trust = float(w.get("trust_score", 0.5))
+            # Normalize
+            success_norm = success / 100.0 if success > 1 else success
+            bw_norm = min(2.0, max(0.1, bandwidth / 100.0))
+            # New workers with no history get moderate score
+            if total_tasks < 3:
+                success_norm = 0.3
+            return (success_norm * 0.60) + (bw_norm * 0.25) + (trust * 0.15)
 
-        # Sort each group by SLA score
-        affiliated.sort(key=worker_sla_score, reverse=True)
-        global_pool.sort(key=worker_sla_score, reverse=True)
+        # Sort each group by score (best first)
+        affiliated.sort(key=worker_score, reverse=True)
+        global_pool.sort(key=worker_score, reverse=True)
 
-        # Build final worker list: all affiliated first, then top global pool
-        # Limit global pool to avoid assigning to unreliable shared workers
+        # Build final list: all affiliated first (sorted by success), then top global
         max_global = max(2, len(chunk_indices) - len(affiliated))
         selected = affiliated + global_pool[:max_global]
 
@@ -2119,15 +2119,18 @@ class Orchestrator:
 
         worker_ids = [w["worker_id"] for w in selected]
 
+        # Log with scores
+        aff_scores = [(w["worker_id"][:12], f"{worker_score(w):.2f}") for w in affiliated[:3]]
         logger.info(
             f"Chunk assignment: {len(affiliated)} affiliated + {min(max_global, len(global_pool))} global "
-            f"= {len(selected)} workers for {len(chunk_indices)} chunks"
+            f"= {len(selected)} workers for {len(chunk_indices)} chunks "
+            f"(top affiliated: {aff_scores})"
         )
 
         # Initialize assignments for each worker
         worker_assignments = {wid: [] for wid in worker_ids}
 
-        # Assign chunks round-robin across workers (spreads load evenly)
+        # Assign chunks round-robin — best workers get first chunks
         for i, chunk_idx in enumerate(chunk_indices):
             worker_id = worker_ids[i % len(worker_ids)]
             worker_assignments[worker_id].append(chunk_idx)
