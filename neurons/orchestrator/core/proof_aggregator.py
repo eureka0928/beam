@@ -178,6 +178,13 @@ class ProofAggregator:
 
         if SUBNET_CORE_CLIENT_AVAILABLE and subnet_core_client:
             logger.info(f"Publishing PoB to SubnetCore: task={proof.task_id[:20]}...")
+            # Resolve worker_coldkey for PoB — needed for payment verification
+            worker_coldkey = getattr(proof, "worker_coldkey", "") or ""
+            if not worker_coldkey and proof.worker_id:
+                try:
+                    worker_coldkey = await subnet_core_client.get_worker_coldkey(proof.worker_id) or ""
+                except Exception:
+                    pass
             pob = PoBSubmission(
                 task_id=proof.task_id,
                 epoch=current_epoch,
@@ -193,6 +200,7 @@ class ProofAggregator:
                 canary_proof=proof.canary_proof,
                 source_region=proof.source_region,
                 dest_region=proof.dest_region,
+                worker_coldkey=worker_coldkey,
             )
             success = await self._try_publish_pob(subnet_core_client, pob)
             if not success:
