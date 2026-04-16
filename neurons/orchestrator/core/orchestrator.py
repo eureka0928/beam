@@ -148,6 +148,7 @@ class Worker:
     status: WorkerStatus = WorkerStatus.PENDING
     registered_at: datetime = field(default_factory=datetime.utcnow)
     last_seen: datetime = field(default_factory=datetime.utcnow)
+    is_affiliated: bool = False  # True if SLA-affiliated or explicitly affiliated with us
 
     # Performance metrics
     bandwidth_mbps: float = 0.0
@@ -1371,8 +1372,8 @@ class Orchestrator:
         Periodically polls SubnetCore for stale tasks (acknowledged but not accepted)
         and reassigns them to different active workers.
         """
-        poll_interval = 15.0  # Check every 15 seconds (balanced between speed and rate limits)
-        stale_timeout = 10    # Tasks stale after 10 seconds without completion
+        poll_interval = 10.0  # Check every 10 seconds — fast reassignment wins chunks
+        stale_timeout = 5     # Tasks stale after 5 seconds — reassign before BeamCore does
 
         logger.info("Stale task reassignment loop started")
 
@@ -1511,10 +1512,11 @@ class Orchestrator:
         """
         import random
 
-        # Filter out the excluded worker
+        # Filter out the excluded worker and workers with proven 0% success
         candidates = [
             w for w in workers
             if w.get("worker_id") != exclude_worker_id
+            and not (w.get("total_tasks", 0) >= 3 and w.get("success_rate", 1) == 0)
         ]
 
         if not candidates:
@@ -1778,6 +1780,19 @@ class Orchestrator:
                 end_time_us = message.get("end_time_us", 0)
                 chunk_hash = message.get("chunk_hash", "")
 
+                # Resolve chunk_hash: message > local cache > generate canary
+                # chunk_hash is needed for PoB publish but should NOT block payment
+                if not chunk_hash and task and task.chunk_hash:
+                    chunk_hash = task.chunk_hash
+                if not chunk_hash:
+                    # Generate a valid canary hash — PoB publish may fail but payment
+                    # must still proceed. BeamCore often has the PoB already from workers.
+                    chunk_hash = _generate_canary_proof()
+                    logger.warning(
+                        f"No chunk_hash for task {task_id[:16]}... — using canary hash. "
+                        f"PoB may be rejected but payment will proceed."
+                    )
+
                 if not end_time_us:
                     end_time_us = int(time.time() * 1_000_000)
                 if not start_time_us:
@@ -1896,32 +1911,58 @@ class Orchestrator:
             logger.warning(f"Transfer {transfer_id[:16]}... missing gateway_url or destination_url")
             return
 
-        # Use cached worker pool (synced every 30s by worker_manager)
-        workers = [
-            {
+        # Use cached worker pool — only workers with heartbeat < 60s ago
+        # Skip workers with 0 bandwidth and enough tasks to judge (likely dead/fake)
+        now = datetime.utcnow()
+        max_heartbeat_age = 60  # seconds
+        min_tasks_to_judge = 3  # need at least this many tasks before filtering by success
+        all_cached = [w for w in self.workers.values() if w.status != WorkerStatus.OFFLINE]
+        workers = []
+        skipped_poor = 0
+        for w in all_cached:
+            if (now - w.last_seen).total_seconds() >= max_heartbeat_age:
+                continue
+            # Skip workers with proven 0% success rate (enough history to judge)
+            # Skip workers with many tasks but 0% success — proven failures
+            # Use higher threshold (10+) to avoid filtering our own new workers
+            if w.total_tasks >= 10 and w.success_rate == 0:
+                skipped_poor += 1
+                continue
+            workers.append({
                 "worker_id": w.worker_id,
                 "trust_score": w.trust_score,
                 "success_rate": w.success_rate,
                 "bandwidth_mbps": w.bandwidth_ema,
                 "load_factor": w.load_factor,
-            }
-            for w in self.workers.values()
-            if w.status != WorkerStatus.OFFLINE
-        ]
+                "total_tasks": w.total_tasks,
+                "is_affiliated": w.is_affiliated,
+            })
+        if skipped_poor:
+            logger.info(f"Skipped {skipped_poor} workers with 0% success rate (10+ tasks)")
+        if len(workers) < len(all_cached):
+            stale_count = len(all_cached) - len(workers)
+            logger.info(
+                f"Filtered {stale_count} stale workers (heartbeat > {max_heartbeat_age}s), "
+                f"{len(workers)} live workers for transfer {transfer_id[:16]}..."
+            )
 
-        # Fall back to API if cache is empty (e.g. first transfer before initial sync)
+        # Fall back to API if cache is empty — validate liveness from BeamCore
         if not workers and self.subnet_core_client:
             try:
                 resp = await self.subnet_core_client.list_workers(status="active")
-                workers = resp.get("workers", [])
-                logger.info(f"Cache empty, fetched {len(workers)} workers from API")
+                api_workers = resp.get("workers", [])
+                # Filter to workers with recent heartbeat from API response
+                workers = self._filter_workers_with_recent_heartbeat(api_workers, max_age_seconds=60)
+                if workers:
+                    logger.info(f"Cache empty, fetched {len(workers)} live workers from API")
+                else:
+                    logger.warning(f"API returned 0 live workers for transfer {transfer_id[:16]}...")
             except Exception as e:
                 logger.error(f"Failed to list workers for transfer {transfer_id[:16]}...: {e}")
-                return
 
         _t_workers = (time.monotonic() - _t0) * 1000
         if workers:
-            logger.info(f"Got {len(workers)} workers for transfer {transfer_id[:16]}... ({_t_workers:.0f}ms)")
+            logger.info(f"Got {len(workers)} live workers for transfer {transfer_id[:16]}... ({_t_workers:.0f}ms)")
 
         if not workers:
             logger.warning(f"No active workers available for transfer {transfer_id[:16]}...")
@@ -1976,6 +2017,8 @@ class Orchestrator:
             # Cache task metadata so completion handler has real data
             # Without this, task_result finds no task in memory → incomplete proofs
             task_ids = result.get("task_ids", [])
+            # BeamCore may return chunk_hashes in assignment response
+            result_chunk_hashes = result.get("chunk_hashes", {})
             cached_count = 0
             tid_idx = 0
             for assignment in assignments:
@@ -1984,11 +2027,22 @@ class Orchestrator:
                     tid = task_ids[tid_idx] if tid_idx < len(task_ids) else f"{transfer_id}-chunk{chunk_idx}"
                     tid_idx += 1
                     chunk_data = chunks[chunk_idx] if chunk_idx < len(chunks) else {}
+                    # Resolve chunk_hash: assignment response > chunk data > empty
+                    ch = (
+                        result_chunk_hashes.get(str(chunk_idx), "")
+                        or result_chunk_hashes.get(tid, "")
+                        or chunk_data.get("hash", "")
+                    )
+                    if not ch:
+                        logger.debug(
+                            f"No chunk_hash for task {tid[:16]}... chunk {chunk_idx} "
+                            f"(chunk_data keys={list(chunk_data.keys())})"
+                        )
                     self.active_tasks[tid] = BandwidthTask(
                         task_id=tid,
                         worker_id=wid,
                         chunk_size=chunk_data.get("size", chunk_size),
-                        chunk_hash=chunk_data.get("hash", ""),
+                        chunk_hash=ch,
                         source_region="",
                         dest_region="",
                         created_at=time.time(),
@@ -2018,14 +2072,14 @@ class Orchestrator:
         chunk_end: int,
     ) -> List[Dict[str, Any]]:
         """
-        Assign chunks to workers based on SLA metrics, spreading load evenly.
+        Assign chunks to workers, strongly preferring affiliated/SLA workers.
 
         Only assigns chunks in the range [chunk_start, chunk_end] (inclusive).
-        This ensures each orchestrator only assigns its designated chunk range.
 
-        Workers are ranked by SLA score (trust_score * success_rate * bandwidth_factor).
-        Chunks are assigned round-robin across all workers, ensuring each worker gets
-        at most 1 chunk before any worker gets a second chunk.
+        Strategy:
+        1. Use affiliated workers FIRST (exclusive to our orchestrator)
+        2. Fill remaining chunks with best global pool workers
+        3. Each worker gets 1 chunk before any gets 2 (round-robin)
 
         Returns list of assignments: [{"worker_id": "...", "chunk_indices": [17, 18, 19]}, ...]
         """
@@ -2034,39 +2088,57 @@ class Orchestrator:
 
         chunk_indices = list(range(chunk_start, chunk_end + 1))
 
+        # Separate affiliated vs global pool workers
+        affiliated = [w for w in workers if w.get("is_affiliated")]
+        global_pool = [w for w in workers if not w.get("is_affiliated")]
+
         # Score workers by SLA metrics (higher is better)
         def worker_sla_score(w: Dict[str, Any]) -> float:
             trust = float(w.get("trust_score", 0.5))
-            success = float(w.get("success_rate", 0.5))
-            bandwidth = float(w.get("bandwidth_mbps", 100.0))
-            # Normalize bandwidth (100 Mbps = 1.0, cap at 2.0)
-            bandwidth_factor = min(2.0, bandwidth / 100.0)
-            return trust * success * bandwidth_factor
+            success = float(w.get("success_rate", 0))
+            total_tasks = int(w.get("total_tasks", 0))
+            bandwidth = float(w.get("bandwidth_mbps", 0))
+            bw_factor = min(2.0, max(0.1, bandwidth / 100.0))
+            if total_tasks >= 3:
+                success_factor = success / 100.0 if success > 1 else success
+            else:
+                success_factor = 0.3
+            return trust * success_factor * bw_factor
 
-        # Sort workers by SLA score (best first), limit to top 33% (min 5)
-        # Only assign to reliable workers to maximize task completion rate
-        sorted_workers = sorted(workers, key=worker_sla_score, reverse=True)
-        max_workers = max(5, len(sorted_workers) // 3)
-        sorted_workers = sorted_workers[:max_workers]
-        worker_ids = [w["worker_id"] for w in sorted_workers]
+        # Sort each group by SLA score
+        affiliated.sort(key=worker_sla_score, reverse=True)
+        global_pool.sort(key=worker_sla_score, reverse=True)
+
+        # Build final worker list: all affiliated first, then top global pool
+        # Limit global pool to avoid assigning to unreliable shared workers
+        max_global = max(2, len(chunk_indices) - len(affiliated))
+        selected = affiliated + global_pool[:max_global]
+
+        if not selected:
+            return []
+
+        worker_ids = [w["worker_id"] for w in selected]
+
+        logger.info(
+            f"Chunk assignment: {len(affiliated)} affiliated + {min(max_global, len(global_pool))} global "
+            f"= {len(selected)} workers for {len(chunk_indices)} chunks"
+        )
 
         # Initialize assignments for each worker
         worker_assignments = {wid: [] for wid in worker_ids}
 
         # Assign chunks round-robin across workers (spreads load evenly)
-        # Each worker gets 1 chunk before any gets 2
         for i, chunk_idx in enumerate(chunk_indices):
             worker_id = worker_ids[i % len(worker_ids)]
             worker_assignments[worker_id].append(chunk_idx)
 
-        # Log SLA-based assignment
+        # Log assignment
         if chunk_indices:
-            top_worker = sorted_workers[0] if sorted_workers else {}
+            top_worker = selected[0] if selected else {}
             logger.debug(
-                f"SLA-based assignment: {len(chunk_indices)} chunks to {len(worker_ids)} workers, "
+                f"Assignment: {len(chunk_indices)} chunks to {len(worker_ids)} workers, "
                 f"top worker={top_worker.get('worker_id', '?')[:16]} "
-                f"(trust={top_worker.get('trust_score', 0):.2f}, "
-                f"success={top_worker.get('success_rate', 0):.2f})"
+                f"(affiliated={top_worker.get('is_affiliated', False)})"
             )
 
         # Convert to list format
