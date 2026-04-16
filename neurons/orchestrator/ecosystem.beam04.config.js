@@ -1,6 +1,6 @@
 module.exports = {
   apps: [{
-    name: 'beam-gen-09',
+    name: 'beam-miner-04',
     script: '/root/beam/neurons/orchestrator/main.py',
     interpreter: '/root/beam/.venv/bin/python',
     cwd: '/root/beam/neurons/orchestrator',
@@ -9,11 +9,11 @@ module.exports = {
       REGISTRY_URL: 'https://beamcore.b1m.ai',
       SUBTENSOR_NETWORK: 'finney',
       NETUID: '105',
-      WALLET_NAME: 'gen',
-      WALLET_HOTKEY: 'gen-09',
-      BT_WALLET_PASSWORD: 'rhkddid928',
+      WALLET_NAME: 'beam-04',
+      WALLET_HOTKEY: 'miner-04',
+      BT_WALLET_PASSWORD: 'beam-04',
       ORCHESTRATOR_HOST: '0.0.0.0',
-      API_PORT: '8009',
+      API_PORT: '8102',
       LOG_LEVEL: 'INFO',
       EXTERNAL_IP: '116.202.53.114',
       REGION: 'US',

@@ -1,6 +1,6 @@
 module.exports = {
   apps: [{
-    name: 'beam-gen-09',
+    name: 'beam-miner-02',
     script: '/root/beam/neurons/orchestrator/main.py',
     interpreter: '/root/beam/.venv/bin/python',
     cwd: '/root/beam/neurons/orchestrator',
@@ -9,11 +9,11 @@ module.exports = {
       REGISTRY_URL: 'https://beamcore.b1m.ai',
       SUBTENSOR_NETWORK: 'finney',
       NETUID: '105',
-      WALLET_NAME: 'gen',
-      WALLET_HOTKEY: 'gen-09',
-      BT_WALLET_PASSWORD: 'rhkddid928',
+      WALLET_NAME: 'beam-02',
+      WALLET_HOTKEY: 'miner-02',
+      BT_WALLET_PASSWORD: 'beam-02',
       ORCHESTRATOR_HOST: '0.0.0.0',
-      API_PORT: '8009',
+      API_PORT: '8069',
       LOG_LEVEL: 'INFO',
       EXTERNAL_IP: '116.202.53.114',
       REGION: 'US',
@@ -28,6 +28,7 @@ module.exports = {
       TASK_TIMEOUT: '120',
       ALPHA_PER_CHUNK: '0.5',
       READY: 'true',
+      BEAMCORE_API_KEY: 'b1m_43ce5d13d0440015593bbcc990f124beddeed57b3df92a7e',
       DATABASE_URL: 'postgresql+asyncpg://beam:beam123@localhost:5432/beam_orchestrator',
     }
   }]
