@@ -96,6 +96,12 @@ WS_RECONNECT_MULTIPLIER = 2.0
 WS_MAX_RECONNECT_ATTEMPTS = 10
 WS_HEARTBEAT_INTERVAL = 25      # seconds
 
+# Orchestrator filter: only accept tasks from these orchestrators
+# Set via BEAM_ORCHESTRATOR_HOTKEYS env (comma-separated)
+ALLOWED_ORCHESTRATORS = set(
+    h.strip() for h in os.environ.get("BEAM_ORCHESTRATOR_HOTKEYS", "").split(",") if h.strip()
+)
+
 # Transfer settings
 MAX_CONCURRENT_TASKS = 8
 FETCH_TIMEOUT = 30  # seconds
@@ -126,6 +132,9 @@ class WorkerState:
     use_websocket: bool = True
     pending_probe_id: Optional[str] = None
     pending_task_accepts: Dict[str, asyncio.Future] = field(default_factory=dict)
+    public_ip: str = ""
+    port: int = 9000
+    region: str = "US"
 
 
 # =============================================================================
@@ -167,15 +176,38 @@ def sign_message(wallet: Any, message: str) -> str:
     return "0x" + signature.hex()
 
 
+def build_auth_headers(state: 'WorkerState') -> Dict[str, str]:
+    """Build signed auth headers for authenticated HTTP calls.
+
+    Signs "{worker_id}:{hotkey}:{timestamp}" and includes IP/region.
+    """
+    hotkey = state.wallet.hotkey.ss58_address
+    timestamp = str(int(time.time()))
+    signature = sign_message(state.wallet, f"{state.worker_id}:{hotkey}:{timestamp}")
+    headers = {
+        "X-Hotkey": hotkey,
+        "X-Signature": signature,
+        "X-Timestamp": timestamp,
+    }
+    if state.api_key:
+        headers["X-Api-Key"] = state.api_key
+    return headers
+
+
 async def register_worker(client: httpx.AsyncClient, state: WorkerState) -> Dict[str, Any]:
     """Register as a worker with SubnetCore.
 
     Requires signing the message "{hotkey}:{ip}:{port}" with the wallet's keypair.
+    IP, port, and region are mandatory — workers without these won't connect.
     """
     wallet = state.wallet
     hotkey = wallet.hotkey.ss58_address
-    ip = await get_public_ip()
-    port = 9000
+    ip = state.public_ip or await get_public_ip()
+    port = state.port
+    region = state.region
+
+    # Store resolved values in state for heartbeats
+    state.public_ip = ip
 
     # Generate a payment pubkey
     payment_pubkey = hashlib.sha256(f"payment:{hotkey}".encode()).hexdigest()
@@ -184,7 +216,7 @@ async def register_worker(client: httpx.AsyncClient, state: WorkerState) -> Dict
     message = f"{hotkey}:{ip}:{port}"
     try:
         signature = sign_message(wallet, message)
-        print(f"[Worker] Signed registration message")
+        print(f"[Worker] Signed registration: ip={ip} port={port} region={region}")
     except Exception as e:
         raise Exception(f"Failed to sign registration: {e}")
 
@@ -193,7 +225,7 @@ async def register_worker(client: httpx.AsyncClient, state: WorkerState) -> Dict
         "ip": ip,
         "port": port,
         "claimed_bandwidth_mbps": 100,
-        "region": os.environ.get("BEAM_WORKER_REGION", "auto"),
+        "region": region,
         "coldkey": wallet.coldkeypub.ss58_address if wallet.coldkeypub else hotkey,
         "payment_pubkey": payment_pubkey,
         "signature": signature,
@@ -298,6 +330,9 @@ async def send_heartbeat(client: httpx.AsyncClient, state: WorkerState) -> bool:
                 "bytes_relayed": state.bytes_relayed,
                 "signature": signature,
                 "timestamp": timestamp,
+                "ip": state.public_ip,
+                "port": state.port,
+                "region": state.region,
             },
             headers=headers,
             timeout=10.0,
@@ -343,8 +378,7 @@ async def track_heartbeat(state: WorkerState, ok: bool) -> None:
 async def poll_worker_tasks(client: httpx.AsyncClient, state: WorkerState) -> List[Dict[str, Any]]:
     """Poll for pending tasks assigned to this worker."""
     try:
-        # Don't send API key - uses orchestrator's rate limit
-        headers = {}
+        headers = build_auth_headers(state)
         response = await client.get(
             f"{state.api_url}/workers/tasks/pending",
             params={"worker_id": state.worker_id, "max_tasks": 3},
@@ -439,7 +473,7 @@ async def complete_task(
         response = await client.post(
             f"{state.api_url}/workers/tasks/complete",
             json=payload,
-            headers={"X-Api-Key": state.api_key} if state.api_key else {},
+            headers=build_auth_headers(state),
             timeout=10.0,
         )
         data = response.json()
@@ -777,6 +811,12 @@ async def handle_task(state: WorkerState, task: dict) -> bool:
     deadline_us = task.get("deadline_us", 0)
     execution_context = task.get("execution_context", {})
 
+    # Filter: only accept tasks from our orchestrators
+    task_orch = task.get("orchestrator_hotkey", "") or task.get("orchestrator_id", "")
+    if ALLOWED_ORCHESTRATORS and task_orch and task_orch not in ALLOWED_ORCHESTRATORS:
+        print(f"[Worker] Rejecting task from unknown orchestrator {task_orch[:16]}...")
+        return False
+
     print(f"[Worker] Processing task: {task_id[:16] if task_id else 'unknown'}...")
 
     # Validate execution_context
@@ -899,6 +939,9 @@ async def ws_send_heartbeat(websocket, state: WorkerState) -> bool:
             "bandwidth_mbps": state.measured_bandwidth_mbps or 100.0,
             "tasks_active": state.active_tasks,
             "bytes_relayed": state.bytes_relayed,
+            "ip": state.public_ip,
+            "port": state.port,
+            "region": state.region,
         }
         if state.pending_probe_id:
             msg["echo_probe_id"] = state.pending_probe_id
@@ -975,7 +1018,13 @@ async def handle_ws_task(state: WorkerState, websocket, task: dict) -> bool:
     deadline_us = task.get("deadline_us", 0)
     execution_context = task.get("execution_context", {})
 
-    print(f"[Worker] [WS] Task: {task_id[:16] if task_id else 'unknown'}...")
+    # Filter: only accept tasks from our orchestrators
+    task_orch = task.get("orchestrator_hotkey", "") or task.get("orchestrator_id", "")
+    if ALLOWED_ORCHESTRATORS and task_orch and task_orch not in ALLOWED_ORCHESTRATORS:
+        print(f"[Worker] [WS] Rejecting task from unknown orchestrator {task_orch[:16]}...")
+        return False
+
+    print(f"[Worker] [WS] Task: {task_id[:16] if task_id else 'unknown'}... orch={task_orch[:16] if task_orch else '?'}")
 
     gateway_url = execution_context.get("gateway_url")
     destination_url = execution_context.get("destination_url")
@@ -1366,8 +1415,31 @@ async def main():
     print(f"API URL: {api_url}")
     print()
 
+    # Resolve worker IP, port, region (mandatory for BeamCore connection)
+    worker_port = int(os.environ.get("BEAM_WORKER_PORT", "9000"))
+    worker_region = os.environ.get("BEAM_WORKER_REGION", "US")
+    try:
+        worker_ip = await get_public_ip()
+    except Exception as e:
+        print(f"Failed to detect public IP: {e}")
+        sys.exit(1)
+    print(f"Worker IP: {worker_ip}, Port: {worker_port}, Region: {worker_region}")
+
     # Create worker state
-    state = WorkerState(wallet=wallet, api_url=api_url)
+    state = WorkerState(
+        wallet=wallet,
+        api_url=api_url,
+        public_ip=worker_ip,
+        port=worker_port,
+        region=worker_region,
+    )
+
+    # Stagger startup to avoid rate-limit storms when launching multiple workers
+    stagger = float(os.environ.get("BEAM_WORKER_STAGGER", "0"))
+    if stagger > 0:
+        jitter = stagger * random.uniform(0.5, 1.5)
+        print(f"[Worker] Staggering startup by {jitter:.1f}s")
+        await asyncio.sleep(jitter)
 
     # Setup signal handlers
     loop = asyncio.get_running_loop()
