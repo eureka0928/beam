@@ -811,12 +811,8 @@ async def handle_task(state: WorkerState, task: dict) -> bool:
     deadline_us = task.get("deadline_us", 0)
     execution_context = task.get("execution_context", {})
 
-    # Filter: only accept tasks from our orchestrators
-    task_orch = task.get("orchestrator_hotkey", "") or task.get("orchestrator_id", "")
-    if ALLOWED_ORCHESTRATORS and task_orch and task_orch not in ALLOWED_ORCHESTRATORS:
-        print(f"[Worker] Rejecting task from unknown orchestrator {task_orch[:16]}...")
-        return False
-
+    # Accept tasks from any orchestrator — workers are in the global pool
+    # BEAM_ORCHESTRATOR_HOTKEYS is only used for affiliation, not task filtering
     print(f"[Worker] Processing task: {task_id[:16] if task_id else 'unknown'}...")
 
     # Validate execution_context
@@ -1018,12 +1014,8 @@ async def handle_ws_task(state: WorkerState, websocket, task: dict) -> bool:
     deadline_us = task.get("deadline_us", 0)
     execution_context = task.get("execution_context", {})
 
-    # Filter: only accept tasks from our orchestrators
+    # Accept tasks from any orchestrator — workers are in the global pool
     task_orch = task.get("orchestrator_hotkey", "") or task.get("orchestrator_id", "")
-    if ALLOWED_ORCHESTRATORS and task_orch and task_orch not in ALLOWED_ORCHESTRATORS:
-        print(f"[Worker] [WS] Rejecting task from unknown orchestrator {task_orch[:16]}...")
-        return False
-
     print(f"[Worker] [WS] Task: {task_id[:16] if task_id else 'unknown'}... orch={task_orch[:16] if task_orch else '?'}")
 
     gateway_url = execution_context.get("gateway_url")
