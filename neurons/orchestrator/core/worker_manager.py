@@ -549,7 +549,11 @@ class WorkerManager:
                 sla_added = 0
                 for w in sla_workers:
                     worker_id = w.get("worker_id", "")
-                    if not worker_id or worker_id in self.workers:
+                    if not worker_id:
+                        continue
+                    if worker_id in self.workers:
+                        # Mark existing worker as affiliated
+                        self.workers[worker_id].is_affiliated = True
                         continue
                     worker = Worker(
                         worker_id=worker_id,
