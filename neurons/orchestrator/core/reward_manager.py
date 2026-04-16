@@ -124,281 +124,187 @@ class RewardManager:
         alpha_per_chunk: float = 0.5,
     ) -> Optional[float]:
         """
-        Calculate, transfer, and record immediate ALPHA payment for a completed task.
+        Execute on-chain ALPHA payment for a completed task and record it.
 
-        ALPHA payments are mandatory - workers are paid in ALPHA tokens with on-chain
-        memo for validator verification (Proof of Payment).
+        Flow (matches BeamCore's verification requirements):
+        1. Dedup + validate inputs
+        2. Parallel fetch: validate-transfer, payment-address
+        3. Resolve worker coldkey (cached)
+        4. On-chain transfer_stake with {transfer_id}:{task_id} memo
+        5. POST /pob/{task_id}/payment with tx_hash
 
-        Returns the reward amount in ALPHA, or None if payment failed.
+        Returns alpha_per_chunk on success, None on skip/fail.
         """
-        # Skip tasks with no bytes relayed — no work done, nothing to pay
-        if not proof.bytes_relayed or proof.bytes_relayed <= 0:
-            logger.debug(
-                f"Skipping payment for task {proof.task_id[:16]}...: 0 bytes relayed"
-            )
-            return None
-
-        # Dedup: skip if this task was already paid
-        if proof.task_id in self._paid_task_ids:
-            logger.warning(
-                f"DEDUP: task {proof.task_id[:16]}... already paid — skipping"
-            )
-            return None
-
-        # ALPHA payment: Validate transfer before payment (mandatory)
-        transfer_id = None
-        if SUBNET_CORE_CLIENT_AVAILABLE and subnet_core_client:
-            try:
-                validation = await subnet_core_client.validate_transfer_for_payment(proof.task_id)
-                if not validation.get("valid"):
-                    error = validation.get("error", "Unknown validation error")
-                    logger.warning(
-                        f"ALPHA payment REJECTED for task {proof.task_id[:16]}...: {error}"
-                    )
-                    return None
-                transfer_id = validation.get("transfer_id")
-                logger.debug(f"Transfer validated for ALPHA payment: {transfer_id}")
-            except Exception as e:
-                logger.warning(f"Transfer validation failed for task {proof.task_id[:16]}...: {e}")
-                # Queue for retry - ALPHA payments are mandatory
-                self._queue_failed_payment(worker, proof, alpha_per_chunk)
-                return None
-        else:
-            logger.warning(f"Cannot pay ALPHA: SubnetCore client not available for task {proof.task_id[:16]}...")
-            return None
-
-        # Extract worker info from proof (always available, even when worker object is None)
+        task_id = proof.task_id
         worker_id = proof.worker_id
         worker_hotkey = proof.worker_hotkey
 
-        current_emission = get_our_emission()
-        emission_delta = current_emission - self.last_emission_check
-
-        if emission_delta <= 0:
-            if total_bytes_relayed > 0:
-                emission_rate = current_emission / total_bytes_relayed
-            else:
-                emission_rate = 1e-6 / (1024 * 1024)
-        else:
-            emission_rate = emission_delta / max(proof.bytes_relayed, 1)
-
-        base_reward = proof.bytes_relayed * emission_rate
-        quality_multiplier = self._calculate_quality_multiplier(worker)
-        reward = base_reward * quality_multiplier
-
-        # Apply fee_percentage: orchestrator shares this % of emission with workers
-        if fee_percentage > 0:
-            fee_multiplier = 1.0 + (fee_percentage / 100.0)
-            reward *= fee_multiplier
-
-        # Bittensor minimum transfer is 500 rao (existential deposit).
-        # Top up dust payments to reach the minimum so workers always get paid.
-        MIN_CHAIN_TRANSFER = 5e-7  # 500 rao = 0.0000005 TAO
-        if reward < MIN_CHAIN_TRANSFER:
-            logger.debug(
-                f"Reward {reward:.12f} TAO topped up to chain minimum "
-                f"{MIN_CHAIN_TRANSFER} TAO for task {proof.task_id[:16]}..."
-            )
-            reward = MIN_CHAIN_TRANSFER
-
-        max_reward = current_emission * 0.1
-        if max_reward > 0:
-            reward = min(reward, max_reward)
-
-        # Note: transfer_stake uses staked ALPHA, not free TAO balance.
-        # The on-chain call will fail if insufficient staked ALPHA, so we
-        # let it attempt and queue for retry on failure rather than pre-checking
-        # the wrong balance type.
-
-        # Resolve worker's actual coldkey for transfer_stake destination.
-        # The verifier checks on-chain transfer_stake destination against the
-        # worker's registered coldkey — NOT the derived payment-address.
-        # Confirmed: UIDs 28, 73, 140 get ⛓ confirmed using worker coldkey.
-        payment_dest = None
-        if SUBNET_CORE_CLIENT_AVAILABLE and subnet_core_client:
-            try:
-                # Step 1: Get worker_id from payment-address API
-                payment_info = await subnet_core_client.get_task_payment_address(proof.task_id)
-                pa_worker_id = payment_info.get("worker_id", "")
-                # Step 2: Resolve actual coldkey from worker_id
-                if pa_worker_id:
-                    payment_dest = await subnet_core_client.get_worker_coldkey(pa_worker_id)
-                if not payment_dest:
-                    # Fallback: try proof.worker_id
-                    payment_dest = await subnet_core_client.get_worker_coldkey(proof.worker_id)
-                if payment_dest:
-                    logger.info(
-                        f"Worker coldkey for task {proof.task_id[:16]}...: {payment_dest[:16]}..."
-                    )
-                else:
-                    raise ValueError("Cannot resolve worker coldkey")
-            except Exception as e:
-                logger.warning(f"Worker coldkey lookup failed for task {proof.task_id[:16]}...: {e}")
-        # Last resort: try metagraph
-        if not payment_dest:
-            payment_dest = await self._resolve_worker_coldkey(worker_hotkey, subtensor, netuid)
-        if not payment_dest:
-            logger.error(
-                f"Cannot pay ALPHA: no worker coldkey for task "
-                f"{proof.task_id[:16]}... — queuing for retry"
-            )
-            self._queue_failed_payment(worker, proof, alpha_per_chunk, transfer_id=transfer_id)
-            self.last_emission_check = current_emission
+        # Early exits
+        if not proof.bytes_relayed or proof.bytes_relayed <= 0:
+            return None
+        if task_id in self._paid_task_ids:
+            logger.debug(f"DEDUP: task {task_id[:16]}... already paid")
+            return None
+        if not (SUBNET_CORE_CLIENT_AVAILABLE and subnet_core_client and wallet and subtensor):
+            logger.warning(f"Missing dependencies for task {task_id[:16]}... — queuing")
+            self._queue_failed_payment(worker, proof, alpha_per_chunk)
             return None
 
-        tx_hash = ""
-        transfer_success = False
-        alpha_amount_rao = 0
+        # Parallel: validate transfer + get payment-address (saves ~500ms)
+        try:
+            validation, payment_info = await asyncio.gather(
+                subnet_core_client.validate_transfer_for_payment(task_id),
+                subnet_core_client.get_task_payment_address(task_id),
+                return_exceptions=True,
+            )
+        except Exception as e:
+            logger.warning(f"Payment prep failed for {task_id[:16]}...: {e}")
+            self._queue_failed_payment(worker, proof, alpha_per_chunk)
+            return None
 
-        # =====================================================================
-        # ALPHA Payment (Mandatory): transfer_stake to worker coldkey
-        # =====================================================================
-        if transfer_id and wallet and subtensor:
+        # Check validation
+        if isinstance(validation, Exception) or not validation.get("valid"):
+            err = validation.get("error", str(validation)) if isinstance(validation, dict) else str(validation)
+            logger.warning(f"Transfer invalid for {task_id[:16]}...: {err}")
+            return None
+        transfer_id = validation.get("transfer_id")
+        if not transfer_id:
+            logger.warning(f"No transfer_id for {task_id[:16]}... — skip")
+            return None
+
+        # Resolve worker coldkey: prefer payment-address API's worker_id, fallback to proof
+        pa_worker_id = ""
+        if isinstance(payment_info, dict):
+            pa_worker_id = payment_info.get("worker_id", "")
+
+        payment_dest = None
+        # Check cache first
+        cache_key = pa_worker_id or worker_id
+        if cache_key and cache_key in self._coldkey_cache:
+            cached_ts = self._coldkey_cache_ts
+            if time.time() - cached_ts < self._coldkey_cache_ttl:
+                payment_dest = self._coldkey_cache.get(cache_key)
+
+        if not payment_dest:
             try:
-                if not payment_dest:
-                    logger.error(
-                        f"Cannot pay ALPHA: no coldkey for task {proof.task_id[:16]}..."
-                    )
-                    self._queue_failed_payment(worker, proof, alpha_per_chunk, transfer_id=transfer_id)
-                    self.last_emission_check = current_emission
-                    return None
-
-                # Transfer ALPHA with on-chain memo via transfer_stake
-                # Memo format: {transfer_id}:{task_id} to ensure uniqueness per worker/task
-                payment_memo = f"{transfer_id}:{proof.task_id}"
-                alpha_amount_rao = int(alpha_per_chunk * 1e9)
-                tx_hash = await self.transfer_alpha_with_memo(
-                    dest_address=payment_dest,
-                    amount_alpha=alpha_per_chunk,
-                    transfer_id=payment_memo,
-                    wallet=wallet,
-                    subtensor=subtensor,
-                    netuid=netuid,
-                )
-
-                if tx_hash:
-                    transfer_success = True
-                    self._payment_success_count += 1
-                    # Record payment on PoB record via BeamCore
-                    # CRITICAL: If this fails, BeamCore thinks we didn't pay → compliance penalty
-                    if SUBNET_CORE_CLIENT_AVAILABLE and subnet_core_client:
-                        recorded = False
-                        for attempt in range(3):
-                            try:
-                                await subnet_core_client.record_pob_payment(
-                                    task_id=proof.task_id,
-                                    tx_hash=tx_hash,
-                                    amount_rao=alpha_amount_rao,
-                                )
-                                recorded = True
-                                break
-                            except Exception as e:
-                                logger.warning(f"Failed to record PoB payment (attempt {attempt+1}/3): {e}")
-                                if attempt < 2:
-                                    await asyncio.sleep(2)
-                        if not recorded:
-                            # Queue for background retry so we don't lose the record
-                            self._pob_recording_queue.append({
-                                "task_id": proof.task_id,
-                                "tx_hash": tx_hash,
-                                "amount_rao": alpha_amount_rao,
-                                "attempts": 3,
-                                "queued_at": time.time(),
-                            })
-                            logger.error(
-                                f"PoB payment recording FAILED after 3 attempts for task "
-                                f"{proof.task_id[:16]}... — queued for background retry"
-                            )
-                    logger.info(
-                        f"ALPHA payment SUCCESS: {alpha_per_chunk} ALPHA to {payment_dest[:16]}... "
-                        f"transfer={transfer_id} tx={tx_hash[:24]}..."
-                    )
-                else:
-                    self._payment_failure_count += 1
-                    logger.error(
-                        f"ALPHA payment FAILED for task {proof.task_id[:16]}... — queuing for retry"
-                    )
-                    self._queue_failed_payment(worker, proof, alpha_per_chunk, transfer_id=transfer_id, payment_dest=payment_dest)
-
+                if pa_worker_id:
+                    payment_dest = await subnet_core_client.get_worker_coldkey(pa_worker_id)
+                if not payment_dest and worker_id:
+                    payment_dest = await subnet_core_client.get_worker_coldkey(worker_id)
+                if payment_dest and cache_key:
+                    self._coldkey_cache[cache_key] = payment_dest
+                    self._coldkey_cache_ts = time.time()
             except Exception as e:
-                self._payment_failure_count += 1
-                logger.error(f"Error in ALPHA payment: {e}", exc_info=True)
-                self._queue_failed_payment(worker, proof, alpha_per_chunk, transfer_id=transfer_id, payment_dest=payment_dest)
+                logger.warning(f"Worker coldkey lookup failed for {task_id[:16]}...: {e}")
 
-        # Note: TAO fallback removed - ALPHA payments are mandatory
-        else:
-            if not transfer_id:
-                logger.warning(f"Cannot pay ALPHA: no transfer_id for task {proof.task_id[:16]}...")
-            if not wallet:
-                logger.warning("Cannot pay ALPHA: no wallet available")
-            if not subtensor:
-                logger.warning("Cannot pay ALPHA: no subtensor connection")
+        # Last resort: metagraph lookup
+        if not payment_dest and worker_hotkey:
+            payment_dest = await self._resolve_worker_coldkey(worker_hotkey, subtensor, netuid)
+
+        if not payment_dest:
+            logger.error(f"No worker coldkey for {task_id[:16]}... — queuing")
+            self._queue_failed_payment(worker, proof, alpha_per_chunk, transfer_id=transfer_id)
+            return None
+
+        # ----- On-chain ALPHA payment (transfer_stake in batch_all with memo) -----
+        alpha_amount_rao = int(alpha_per_chunk * 1e9)
+        payment_memo = f"{transfer_id}:{task_id}"
+
+        try:
+            tx_hash = await self.transfer_alpha_with_memo(
+                dest_address=payment_dest,
+                amount_alpha=alpha_per_chunk,
+                transfer_id=payment_memo,
+                wallet=wallet,
+                subtensor=subtensor,
+                netuid=netuid,
+            )
+        except Exception as e:
+            self._payment_failure_count += 1
+            logger.error(f"transfer_stake error for {task_id[:16]}...: {e}")
             self._queue_failed_payment(worker, proof, alpha_per_chunk, transfer_id=transfer_id, payment_dest=payment_dest)
             return None
 
-        self.last_emission_check = current_emission
+        if not tx_hash:
+            self._payment_failure_count += 1
+            logger.error(f"transfer_stake returned no tx for {task_id[:16]}... — queuing")
+            self._queue_failed_payment(worker, proof, alpha_per_chunk, transfer_id=transfer_id, payment_dest=payment_dest)
+            return None
 
-        # Use actual on-chain payment amount for all records, not emission-based dust
-        # alpha_amount_rao is the real amount transferred via transfer_stake
-        actual_payment_rao = alpha_amount_rao if transfer_success else 0
+        # ----- Record payment to BeamCore (3 retries, then background queue) -----
+        self._paid_task_ids.add(task_id)
+        self._payment_success_count += 1
+        self.total_rewards_distributed += alpha_per_chunk
 
-        if transfer_success:
-            self._paid_task_ids.add(proof.task_id)
-            # Update worker stats only if worker object exists (not in challenge flow)
-            if worker is not None:
-                worker.rewards_earned_epoch += actual_payment_rao
-                worker.rewards_earned_total += actual_payment_rao
-            self.total_rewards_distributed += alpha_per_chunk
+        recorded = False
+        for attempt in range(3):
+            try:
+                await subnet_core_client.record_pob_payment(
+                    task_id=task_id, tx_hash=tx_hash, amount_rao=alpha_amount_rao,
+                )
+                recorded = True
+                break
+            except Exception as e:
+                logger.warning(f"Record PoB payment retry {attempt+1}/3 for {task_id[:16]}...: {e}")
+                if attempt < 2:
+                    await asyncio.sleep(2)
 
-            if DB_AVAILABLE and db:
-                try:
-                    await db.save_worker_payment(
-                        epoch=current_epoch,
-                        worker_id=worker_id,
-                        worker_hotkey=worker_hotkey,
-                        bytes_relayed=proof.bytes_relayed,
-                        tasks_completed=1,
-                        amount_earned=actual_payment_rao,
-                        merkle_proof=tx_hash,
-                        leaf_index=0,
-                    )
-                except Exception as e:
-                    logger.warning(f"Failed to save worker payment: {e}")
+        if not recorded:
+            self._pob_recording_queue.append({
+                "task_id": task_id, "tx_hash": tx_hash,
+                "amount_rao": alpha_amount_rao,
+                "attempts": 3, "queued_at": time.time(),
+            })
+            logger.error(f"PoB record failed for {task_id[:16]}... — queued for background retry")
 
-            if SUBNET_CORE_CLIENT_AVAILABLE and subnet_core_client:
-                try:
-                    from clients.subnet_core_client import WorkerPaymentData
-                    payment_data = WorkerPaymentData(
-                        orchestrator_hotkey=hotkey or "",
-                        epoch=current_epoch,
-                        worker_id=worker_id,
-                        worker_hotkey=worker_hotkey,
-                        bytes_relayed=proof.bytes_relayed,
-                        tasks_completed=1,
-                        amount_earned=actual_payment_rao,
-                        task_id=proof.task_id,
-                        tx_hash=tx_hash,
-                    )
-                    await subnet_core_client.record_worker_payment(payment_data)
-                    logger.debug(f"Payment recorded to SubnetCore: task={proof.task_id[:16]}...")
-                except Exception as e:
-                    logger.warning(f"Failed to record payment via SubnetCore: {e}")
-
-            # Update epoch summary with actual payment amount
-            self._track_epoch_payment(current_epoch, worker_id, worker_hotkey, actual_payment_rao, proof.bytes_relayed)
-            await self._report_epoch_summary(current_epoch, hotkey, subnet_core_client)
-
-            # Note: acknowledge is handled by the WS client after _handle_task_completion_notification
-            # returns True. No need to call it again here — double-acknowledge is harmless but wasteful.
-
-        status = "PAID" if transfer_success else "QUEUED FOR RETRY"
         logger.info(
-            f"Immediate ALPHA payment [{status}]: Worker {worker_id[:8]} ({worker_hotkey[:12]}...) "
-            f"earned {alpha_per_chunk} ALPHA for {proof.bytes_relayed:,} bytes "
-            f"(transfer={transfer_id})"
+            f"✓ PAID {alpha_per_chunk} ALPHA → {payment_dest[:16]}... "
+            f"task={task_id[:16]}... memo={payment_memo} tx={tx_hash[:24]}..."
         )
 
-        return alpha_per_chunk if transfer_success else None
+        # Update worker stats
+        if worker is not None:
+            worker.rewards_earned_epoch += alpha_amount_rao
+            worker.rewards_earned_total += alpha_amount_rao
+
+        # Save to DB
+        if DB_AVAILABLE and db:
+            try:
+                await db.save_worker_payment(
+                    epoch=current_epoch,
+                    worker_id=worker_id,
+                    worker_hotkey=worker_hotkey,
+                    bytes_relayed=proof.bytes_relayed,
+                    tasks_completed=1,
+                    amount_earned=alpha_amount_rao,
+                    merkle_proof=tx_hash,
+                    leaf_index=0,
+                )
+            except Exception as e:
+                logger.warning(f"DB save failed: {e}")
+
+        # Record to SubnetCore (non-critical)
+        try:
+            from clients.subnet_core_client import WorkerPaymentData
+            await subnet_core_client.record_worker_payment(WorkerPaymentData(
+                orchestrator_hotkey=hotkey or "",
+                epoch=current_epoch,
+                worker_id=worker_id,
+                worker_hotkey=worker_hotkey,
+                bytes_relayed=proof.bytes_relayed,
+                tasks_completed=1,
+                amount_earned=alpha_amount_rao,
+                task_id=task_id,
+                tx_hash=tx_hash,
+            ))
+        except Exception as e:
+            logger.debug(f"SubnetCore payment record failed (non-critical): {e}")
+
+        # Epoch tracking
+        self._track_epoch_payment(current_epoch, worker_id, worker_hotkey, alpha_amount_rao, proof.bytes_relayed)
+        await self._report_epoch_summary(current_epoch, hotkey, subnet_core_client)
+
+        return alpha_per_chunk
 
     def _track_epoch_payment(self, epoch: int, worker_id: str, worker_hotkey: str, amount_nano: int, bytes_relayed: int):
         """Accumulate payment totals and leaf data for an epoch."""
