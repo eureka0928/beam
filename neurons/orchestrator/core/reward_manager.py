@@ -210,81 +210,55 @@ class RewardManager:
         # let it attempt and queue for retry on failure rather than pre-checking
         # the wrong balance type.
 
-        # Resolve payment address via SubnetCore, with fallback to worker_hotkey
+        # Resolve payment address from BeamCore payment-address API.
+        # This is the AUTHORITATIVE destination for transfer_stake — BeamCore's
+        # verifier checks on-chain tx destination against this address.
+        # Confirmed working: UID 102 reached compliance=0.50 using this flow.
         payment_dest = None
         if SUBNET_CORE_CLIENT_AVAILABLE and subnet_core_client:
             try:
                 payment_info = await subnet_core_client.get_task_payment_address(proof.task_id)
                 payment_dest = payment_info.get("address")
-                if not payment_dest:
-                    raise ValueError("SubnetCore returned empty payment address")
-                logger.debug(
-                    f"Resolved payment address for task {proof.task_id[:16]}...: {payment_dest[:16]}..."
-                )
-            except Exception as e:
-                # Fallback: use worker_hotkey directly as payment address
-                if proof.worker_hotkey:
-                    payment_dest = proof.worker_hotkey
-                    logger.warning(
-                        f"Payment address lookup failed for task {proof.task_id[:16]}...: {e} "
-                        f"— using worker_hotkey {payment_dest[:16]}... as fallback"
+                if payment_dest:
+                    logger.info(
+                        f"Payment address for task {proof.task_id[:16]}...: {payment_dest[:16]}..."
                     )
                 else:
-                    logger.error(
-                        f"Failed to resolve payment address from SubnetCore for task "
-                        f"{proof.task_id[:16]}...: {e} — queuing for retry"
-                    )
-                    self._queue_failed_payment(worker, proof, alpha_per_chunk, transfer_id=transfer_id)
-                    self.last_emission_check = current_emission
-                    return None
-        else:
-            # No SubnetCore client - use worker_hotkey directly
-            if proof.worker_hotkey:
-                payment_dest = proof.worker_hotkey
-                logger.info(
-                    f"SubnetCore client not available — using worker_hotkey "
-                    f"{payment_dest[:16]}... as payment address"
-                )
-            else:
-                logger.error(
-                    f"SubnetCore client not available and no worker_hotkey — "
-                    f"cannot resolve payment address. Queuing payment for retry."
-                )
-                self._queue_failed_payment(worker, proof, alpha_per_chunk, transfer_id=transfer_id)
-                self.last_emission_check = current_emission
-                return None
+                    raise ValueError("BeamCore returned empty payment address")
+            except Exception as e:
+                logger.warning(f"Payment address lookup failed for task {proof.task_id[:16]}...: {e}")
+        if not payment_dest:
+            logger.error(
+                f"Cannot pay ALPHA: no payment address for task "
+                f"{proof.task_id[:16]}... — queuing for retry"
+            )
+            self._queue_failed_payment(worker, proof, alpha_per_chunk, transfer_id=transfer_id)
+            self.last_emission_check = current_emission
+            return None
 
         tx_hash = ""
         transfer_success = False
         alpha_amount_rao = 0
 
         # =====================================================================
-        # ALPHA Payment (Mandatory): transfer_stake with on-chain memo
+        # ALPHA Payment (Mandatory): transfer_stake to worker coldkey
         # =====================================================================
         if transfer_id and wallet and subtensor:
             try:
-                # Resolve worker coldkey for transfer_stake payment
-                # Priority: 1) proof.worker_coldkey (from WS push), 2) BeamCore API, 3) metagraph
-                worker_coldkey = getattr(proof, "worker_coldkey", "") or ""
-                if not worker_coldkey and SUBNET_CORE_CLIENT_AVAILABLE and subnet_core_client:
-                    worker_coldkey = await subnet_core_client.get_worker_coldkey(proof.worker_id)
-                if not worker_coldkey:
-                    worker_coldkey = await self._resolve_worker_coldkey(worker_hotkey, subtensor, netuid)
-                if not worker_coldkey:
+                if not payment_dest:
                     logger.error(
-                        f"Cannot pay ALPHA: failed to resolve coldkey for worker {worker_hotkey[:16]}..."
+                        f"Cannot pay ALPHA: no coldkey for task {proof.task_id[:16]}..."
                     )
                     self._queue_failed_payment(worker, proof, alpha_per_chunk, transfer_id=transfer_id)
                     self.last_emission_check = current_emission
                     return None
 
-                # Transfer ALPHA with on-chain memo
+                # Transfer ALPHA with on-chain memo via transfer_stake
                 # Memo format: {transfer_id}:{task_id} to ensure uniqueness per worker/task
-                # This prevents reusing the same memo for multiple payments
                 payment_memo = f"{transfer_id}:{proof.task_id}"
                 alpha_amount_rao = int(alpha_per_chunk * 1e9)
                 tx_hash = await self.transfer_alpha_with_memo(
-                    worker_coldkey=worker_coldkey,
+                    dest_address=payment_dest,
                     amount_alpha=alpha_per_chunk,
                     transfer_id=payment_memo,
                     wallet=wallet,
@@ -326,7 +300,7 @@ class RewardManager:
                                 f"{proof.task_id[:16]}... — queued for background retry"
                             )
                     logger.info(
-                        f"ALPHA payment SUCCESS: {alpha_per_chunk} ALPHA to {worker_coldkey[:16]}... "
+                        f"ALPHA payment SUCCESS: {alpha_per_chunk} ALPHA to {payment_dest[:16]}... "
                         f"transfer={transfer_id} tx={tx_hash[:24]}..."
                     )
                 else:
@@ -334,12 +308,12 @@ class RewardManager:
                     logger.error(
                         f"ALPHA payment FAILED for task {proof.task_id[:16]}... — queuing for retry"
                     )
-                    self._queue_failed_payment(worker, proof, alpha_per_chunk, transfer_id=transfer_id)
+                    self._queue_failed_payment(worker, proof, alpha_per_chunk, transfer_id=transfer_id, payment_dest=payment_dest)
 
             except Exception as e:
                 self._payment_failure_count += 1
                 logger.error(f"Error in ALPHA payment: {e}", exc_info=True)
-                self._queue_failed_payment(worker, proof, alpha_per_chunk, transfer_id=transfer_id)
+                self._queue_failed_payment(worker, proof, alpha_per_chunk, transfer_id=transfer_id, payment_dest=payment_dest)
 
         # Note: TAO fallback removed - ALPHA payments are mandatory
         else:
@@ -349,7 +323,7 @@ class RewardManager:
                 logger.warning("Cannot pay ALPHA: no wallet available")
             if not subtensor:
                 logger.warning("Cannot pay ALPHA: no subtensor connection")
-            self._queue_failed_payment(worker, proof, alpha_per_chunk, transfer_id=transfer_id)
+            self._queue_failed_payment(worker, proof, alpha_per_chunk, transfer_id=transfer_id, payment_dest=payment_dest)
             return None
 
         self.last_emission_check = current_emission
@@ -461,7 +435,7 @@ class RewardManager:
         except Exception as e:
             logger.error(f"[MERKLE] Failed to report epoch summary: {e}", exc_info=True)
 
-    def _queue_failed_payment(self, worker, proof, reward_tao: float, transfer_id: str = None):
+    def _queue_failed_payment(self, worker, proof, reward_tao: float, transfer_id: str = None, payment_dest: str = None):
         """Queue a failed/partial payment for retry when balance is available."""
         # Use proof attributes (always available) since worker may be None
         self._payment_retry_queue.append({
@@ -469,6 +443,7 @@ class RewardManager:
             "worker_id": proof.worker_id,
             "task_id": proof.task_id,
             "transfer_id": transfer_id,
+            "payment_dest": payment_dest,
             "proof": proof,
             "reward_tao": reward_tao,
             "attempts": 0,
@@ -561,23 +536,21 @@ class RewardManager:
             reward = min(item["reward_tao"], available)
 
             try:
-                # Resolve worker coldkey for transfer_stake
-                # Priority: BeamCore API (fast) -> metagraph (slow fallback)
-                worker_hotkey = item.get("worker_hotkey", "")
-                worker_id = item.get("worker_id", "")
-                worker_coldkey = None
-                if SUBNET_CORE_CLIENT_AVAILABLE and subnet_core_client and worker_id:
-                    worker_coldkey = await subnet_core_client.get_worker_coldkey(worker_id)
-                if not worker_coldkey:
-                    worker_coldkey = await self._resolve_worker_coldkey(worker_hotkey, subtensor, netuid=105)
-                if not worker_coldkey:
+                # Resolve payment address from BeamCore (authoritative destination)
+                retry_payment_dest = item.get("payment_dest", "")
+                if not retry_payment_dest and SUBNET_CORE_CLIENT_AVAILABLE and subnet_core_client:
+                    try:
+                        payment_info = await subnet_core_client.get_task_payment_address(task_id)
+                        retry_payment_dest = payment_info.get("address", "")
+                    except Exception as e:
+                        logger.warning(f"Retry: payment address lookup failed for {task_id[:16]}...: {e}")
+                if not retry_payment_dest:
                     item["attempts"] += 1
-                    logger.warning(f"Retry: cannot resolve coldkey for {worker_hotkey[:16]}...")
+                    logger.warning(f"Retry: cannot resolve payment address for task {task_id[:16]}...")
                     continue
 
                 # ALPHA payment via transfer_stake with on-chain memo
                 # Memo format must be {transfer_id}:{task_id} per BeamCore spec
-                # Always pay alpha_per_chunk (0.5 ALPHA) — not the dust emission reward
                 alpha_per_chunk = self.settings.alpha_per_chunk if hasattr(self.settings, 'alpha_per_chunk') else 0.5
                 alpha_amount = alpha_per_chunk
                 retry_transfer_id = item.get("transfer_id")
@@ -596,7 +569,7 @@ class RewardManager:
                     continue
                 payment_memo = f"{retry_transfer_id}:{task_id}"
                 tx_hash = await self.transfer_alpha_with_memo(
-                    worker_coldkey=worker_coldkey,
+                    dest_address=retry_payment_dest,
                     amount_alpha=alpha_amount,
                     transfer_id=payment_memo,
                     wallet=wallet,
@@ -609,7 +582,7 @@ class RewardManager:
                     if task_id:
                         self._paid_task_ids.add(task_id)
                     logger.info(
-                        f"Retry payment SUCCESS: {alpha_amount} ALPHA to {worker_coldkey[:16]}... tx={tx_hash[:24]}..."
+                        f"Retry payment SUCCESS: {alpha_amount} ALPHA to {retry_payment_dest[:16]}... tx={tx_hash[:24]}..."
                     )
 
                     # Record payment on PoB record via BeamCore
@@ -754,7 +727,7 @@ class RewardManager:
 
     async def transfer_alpha_with_memo(
         self,
-        worker_coldkey: str,
+        dest_address: str,
         amount_alpha: float,
         transfer_id: str,
         wallet,
@@ -762,16 +735,18 @@ class RewardManager:
         netuid: int,
     ) -> Optional[str]:
         """
-        Transfer ALPHA tokens to a worker with on-chain memo via utility.batch_all.
+        Transfer ALPHA tokens via transfer_stake with on-chain memo.
 
-        Batches atomically:
-        1. system.remarkWithEvent(transfer_id) - on-chain memo for validator verification
-        2. SubtensorModule.transfer_stake(...) - actual ALPHA transfer
+        Uses utility.batch_all to atomically execute:
+        1. system.remark_with_event(memo) - on-chain memo for validator verification
+        2. SubtensorModule.transfer_stake(...) - ALPHA transfer
+
+        The dest_address from payment-address API is the worker's coldkey for transfer_stake.
 
         Args:
-            worker_coldkey: Destination coldkey address (worker's coldkey)
-            amount_alpha: Amount of ALPHA to transfer (e.g., 1.0 for 1 ALPHA)
-            transfer_id: Transfer ID to embed as on-chain memo (e.g., "xfer-abc123")
+            dest_address: Payment address (worker coldkey) from BeamCore payment-address API
+            amount_alpha: Amount of ALPHA to transfer (e.g., 0.5 for 0.5 ALPHA)
+            transfer_id: Memo string "{transfer_id}:{task_id}" for on-chain remark
             wallet: Bittensor wallet with coldkey for signing
             subtensor: Subtensor connection
             netuid: Network UID (105 for mainnet, 304 for testnet)
@@ -796,20 +771,19 @@ class RewardManager:
             # Access the underlying substrate interface
             substrate = subtensor.substrate
 
-            # Compose remark call with transfer_id as memo
+            # Compose remark call with memo
             remark_call = substrate.compose_call(
                 call_module='System',
                 call_function='remark_with_event',
                 call_params={'remark': transfer_id.encode()}
             )
 
-            # Compose transfer_stake call
-            # Note: Parameter names may vary by SDK version
+            # Compose transfer_stake call — BeamCore verifier expects this
             transfer_call = substrate.compose_call(
                 call_module='SubtensorModule',
                 call_function='transfer_stake',
                 call_params={
-                    'destination_coldkey': worker_coldkey,
+                    'destination_coldkey': dest_address,
                     'hotkey': wallet.hotkey.ss58_address,
                     'origin_netuid': netuid,
                     'destination_netuid': netuid,
@@ -824,7 +798,7 @@ class RewardManager:
                 call_params={'calls': [remark_call, transfer_call]}
             )
 
-            # Sign with coldkey (required for transfer_stake)
+            # Sign with coldkey
             extrinsic = substrate.create_signed_extrinsic(
                 call=batch_call,
                 keypair=wallet.coldkey,
@@ -840,7 +814,7 @@ class RewardManager:
             if receipt.is_success:
                 tx_hash = f"{receipt.extrinsic_hash}:{receipt.block_hash}"
                 logger.info(
-                    f"ALPHA transfer SUCCESS: {amount_alpha} ALPHA to {worker_coldkey[:16]}... "
+                    f"ALPHA transfer SUCCESS: {amount_alpha} ALPHA to {dest_address[:16]}... "
                     f"memo={transfer_id} tx={tx_hash[:32]}..."
                 )
                 return tx_hash
