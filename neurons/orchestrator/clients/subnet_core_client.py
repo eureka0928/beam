@@ -1764,6 +1764,28 @@ class SubnetCoreClient:
             logger.warning(f"Worker membership lookup failed for {hotkey[:16]}...: {e}")
             return None
 
+    async def remove_pool_worker(self, worker_id: str, reason: str = "poor performance") -> bool:
+        """Remove a worker from this orchestrator's pool.
+
+        DELETE /sla/orchestrators/{orchestrator_id}/workers/{worker_id}
+        """
+        client = await self._get_client()
+        try:
+            response = await client.request(
+                "DELETE",
+                f"{self.base_url}/sla/orchestrators/{self.orchestrator_uid}/workers/{worker_id}",
+                json={
+                    "requester_hotkey": self.orchestrator_hotkey,
+                    "reason": reason,
+                },
+            )
+            response.raise_for_status()
+            logger.info(f"Removed worker {worker_id[:16]}... from pool: {reason}")
+            return True
+        except Exception as e:
+            logger.warning(f"Failed to remove worker {worker_id[:16]}...: {e}")
+            return False
+
     async def get_worker(self, worker_id: str) -> Dict[str, Any]:
         """Get a specific worker (affiliation-scoped)."""
         client = await self._get_client()
@@ -2127,16 +2149,23 @@ class SubnetCoreClient:
             raise
 
     async def get_task(self, task_id: str) -> Dict[str, Any]:
-        """Fetch a single task by ID.
+        """Fetch task details by searching the task list.
 
-        GET /orchestrators/tasks/{task_id}
+        NOTE: GET /orchestrators/tasks/{task_id} does not exist (only PATCH).
+        Falls back to searching the list endpoint.
         """
         client = await self._get_client()
         response = await client.get(
-            f"{self.base_url}/orchestrators/tasks/{task_id}",
+            f"{self.base_url}/orchestrators/tasks",
+            params={"limit": 100},
         )
         response.raise_for_status()
-        return response.json()
+        data = response.json()
+        tasks = data if isinstance(data, list) else data.get("tasks", [])
+        for t in tasks:
+            if t.get("task_id") == task_id:
+                return t
+        raise ValueError(f"Task {task_id[:16]}... not found in list")
 
     async def get_stale_tasks(self, timeout_seconds: int = 30) -> List[Dict[str, Any]]:
         """
