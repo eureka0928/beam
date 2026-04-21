@@ -58,7 +58,6 @@ case $MODE in
     SUBNET_AUTH_ENABLED=false \
     API_PORT=$PORT \
     SUBNET_CORE_URL="http://127.0.0.1:8080" \
-    BUFFER_URL="${BUFFER_URL:-http://127.0.0.1:8081}" \
     python main.py 2>&1 | tee -a "$LOG_FILE"
     ;;
 

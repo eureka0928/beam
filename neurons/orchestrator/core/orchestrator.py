@@ -1557,7 +1557,6 @@ class Orchestrator:
                 signer = self.wallet.hotkey
             self.subnet_core_client = init_subnet_core_client(
                 base_url=self.settings.subnet_core_url,
-                websocket_base_url=self.settings.buffer_url,
                 orchestrator_hotkey=self.hotkey or "unknown",
                 orchestrator_uid=self.our_uid or 0,
                 signer=signer,

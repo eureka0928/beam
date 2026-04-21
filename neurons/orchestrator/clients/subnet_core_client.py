@@ -234,7 +234,6 @@ class SubnetCoreClient:
     def __init__(
         self,
         base_url: str,
-        websocket_base_url: Optional[str],
         orchestrator_hotkey: str,
         orchestrator_uid: int,
         timeout: float = 30.0,
@@ -245,14 +244,12 @@ class SubnetCoreClient:
 
         Args:
             base_url: Base URL of BeamCore (e.g., http://localhost:8080)
-            websocket_base_url: Optional Buffer base URL for websocket traffic
             orchestrator_hotkey: This orchestrator's hotkey for authentication
             orchestrator_uid: This orchestrator's UID
             timeout: Request timeout in seconds
             signer: Optional bittensor wallet hotkey with .sign() method
         """
         self.base_url = base_url.rstrip("/")
-        self.websocket_base_url = (websocket_base_url or base_url).rstrip("/")
         self.orchestrator_hotkey = orchestrator_hotkey
         self.orchestrator_uid = orchestrator_uid
         self.timeout = timeout
@@ -346,7 +343,7 @@ class SubnetCoreClient:
     def _get_ws_url(self) -> str:
         """Get WebSocket URL from base URL."""
         # Convert http(s)://host to ws(s)://host
-        ws_url = self.websocket_base_url.replace("https://", "wss://").replace("http://", "ws://")
+        ws_url = self.base_url.replace("https://", "wss://").replace("http://", "ws://")
         return f"{ws_url}/ws/orchestrators/{self.orchestrator_hotkey}"
 
     def _sign_ws_auth(self) -> tuple[str, str]:
@@ -2248,7 +2245,6 @@ def get_subnet_core_client() -> Optional[SubnetCoreClient]:
 
 def init_subnet_core_client(
     base_url: str,
-    websocket_base_url: Optional[str],
     orchestrator_hotkey: str,
     orchestrator_uid: int,
     timeout: float = 30.0,
@@ -2259,7 +2255,6 @@ def init_subnet_core_client(
 
     Args:
         base_url: Base URL of BeamCore
-        websocket_base_url: Optional Buffer base URL for websocket traffic
         orchestrator_hotkey: This orchestrator's hotkey
         orchestrator_uid: This orchestrator's UID
         timeout: Request timeout
@@ -2269,20 +2264,8 @@ def init_subnet_core_client(
         The initialized client
     """
     global _client
-    _client = SubnetCoreClient(
-        base_url,
-        websocket_base_url,
-        orchestrator_hotkey,
-        orchestrator_uid,
-        timeout,
-        signer=signer,
-    )
-    logger.info(
-        "SubnetCoreClient initialized: http=%s ws=%s (signer=%s)",
-        base_url,
-        websocket_base_url or base_url,
-        "yes" if signer else "none",
-    )
+    _client = SubnetCoreClient(base_url, orchestrator_hotkey, orchestrator_uid, timeout, signer=signer)
+    logger.info(f"SubnetCoreClient initialized: {base_url} (signer={'yes' if signer else 'none'})")
     return _client
 
 
