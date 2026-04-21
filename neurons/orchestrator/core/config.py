@@ -138,6 +138,7 @@ class OrchestratorSettings(BaseSettings):
         default="http://localhost:8080",
         env="SUBNET_CORE_URL"
     )
+    buffer_url: Optional[str] = Field(default=None, env="BUFFER_URL")
 
     # ==========================================================================
     # Blind Worker Mode (Anonymous Orchestration)
