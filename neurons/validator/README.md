@@ -126,7 +126,6 @@ All operational data flows through BeamCore - validators do NOT maintain indepen
 
 | Metric                            | Description                | Used For         |
 | --------------------------------- | -------------------------- | ---------------- |
-| `stake_tao`                       | TAO staked by orchestrator | Stake weight     |
 | `latest_uptime_percent`           | % of time online (0-100)   | Uptime score     |
 | `latest_bandwidth_mbps`           | Aggregate pool bandwidth   | Bandwidth score  |
 | `latest_latency_p95_ms`           | 95th percentile latency    | Latency score    |
@@ -191,8 +190,6 @@ bandwidth_score = min(bandwidth_mbps / 10_000, 1.0)
 # Latency: 0 ms = 1.0, 500+ ms = 0.0 (inverted)
 latency_score = max(0, 1.0 - (latency_ms / 500))
 
-# Stake: sqrt scaling, capped at 10000 TAO
-stake_weight = sqrt(min(stake_tao, 10000)) / sqrt(10000)
 ```
 
 ### Final Weight Calculation
@@ -206,7 +203,7 @@ SLA Score = (
     0.10 × acceptance_rate
 )
 
-Final Weight = SLA Score × Stake Weight × (1 - Penalty)
+Final Weight = SLA Score × (1 - Penalty)
 
 Normalized Weight = Final Weight / sum(all Final Weights)
 ```
@@ -518,7 +515,7 @@ payment_multiplier = self.payment_penalty_multipliers.get(hotkey, 1.0)
 # Normal orchestrator: payment_multiplier = 1.0 (full emissions)
 # Slashed orchestrator: payment_multiplier = 0.5 (50% emissions)
 
-final_score = sla_score × stake_weight × payment_multiplier
+final_score = sla_score × payment_multiplier
 ```
 
 ### Code Location

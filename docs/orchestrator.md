@@ -320,7 +320,6 @@ SUBNET_AUTH_REQUIRE_METAGRAPH=true
 
 # Client auth
 CLIENT_AUTH_ENABLED=true
-CLIENT_STAKE_GATED_ENABLED=true
 
 # =============================================================================
 # REDIS (Required for production)
@@ -409,7 +408,6 @@ INFO | Network: test (netuid: 304)
 INFO | Syncing metagraph...
 INFO | Metagraph synced: 10 neurons
 INFO | Orchestrator UID: 5
-INFO | Stake: 500.0 TAO
 INFO | BeamCore connection: https://beamcore-dev.b1m.ai
 INFO | Starting API server on 0.0.0.0:8000
 INFO | Ready to accept workers

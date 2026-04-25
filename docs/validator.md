@@ -189,18 +189,6 @@ btcli wallet overview --wallet.name validator --subtensor.network test
 # Should show your UID on subnet 304 (testnet) or 105 (mainnet)
 ```
 
-### 4. Stake TAO (Required for Weight Setting)
-
-Validators need stake to set weights. More stake = more influence on consensus.
-
-```bash
-# Add stake to your validator hotkey
-btcli stake add --wallet.name validator --wallet.hotkey default \
-    --subtensor.network test --amount 100
-```
-
-**Minimum recommended stake**: 100 TAO (testnet), 1000+ TAO (mainnet)
-
 ---
 
 ## Installation
@@ -317,7 +305,6 @@ BEAM_VALIDATOR_MIN_TRANSFER_TIME_US=50000
 # =============================================================================
 BEAM_VALIDATOR_BLOCKS_BETWEEN_WEIGHTS=100
 BEAM_VALIDATOR_WEIGHT_ALPHA=0.3
-BEAM_VALIDATOR_MIN_CONNECTION_STAKE=10.0
 
 # =============================================================================
 # REDIS (Optional - BEAM_VALIDATOR_ prefix)
@@ -419,7 +406,6 @@ INFO | Network: test (netuid: 304)
 INFO | Syncing metagraph...
 INFO | Metagraph synced: 10 neurons
 INFO | Validator UID: 5
-INFO | Stake: 500.0 TAO
 INFO | Starting validation loop...
 INFO | BeamCore connection: https://beamcore-dev.b1m.ai
 INFO | Ready to validate
@@ -511,18 +497,7 @@ btcli subnet register --netuid 304 --subtensor.network test \
     --wallet.name validator --wallet.hotkey default
 ```
 
-#### 2. "Insufficient stake for weight setting"
-
-```
-ERROR | Cannot set weights: insufficient stake
-```
-
-**Solution**: Add more stake:
-```bash
-btcli stake add --wallet.name validator --amount 100 --subtensor.network test
-```
-
-#### 3. "BeamCore connection failed"
+#### 2. "BeamCore connection failed"
 
 ```
 ERROR | Failed to connect to BeamCore: Connection refused
@@ -532,7 +507,7 @@ ERROR | Failed to connect to BeamCore: Connection refused
 - Verify `BEAM_VALIDATOR_SUBNET_CORE_URL` is correct
 - Check if BeamCore is reachable: `curl https://beamcore-dev.b1m.ai/health`
 
-#### 4. "Metagraph sync timeout"
+#### 3. "Metagraph sync timeout"
 
 ```
 WARNING | Metagraph sync timed out after 30s
@@ -543,14 +518,13 @@ WARNING | Metagraph sync timed out after 30s
 - Validator will retry automatically
 - If persistent, check your subtensor network setting
 
-#### 5. "Weight setting failed"
+#### 4. "Weight setting failed"
 
 ```
 ERROR | Failed to set weights: ...
 ```
 
 **Solutions**:
-- Ensure you have enough stake
 - Verify wallet permissions: hotkey must be accessible
 - Check network connectivity to subtensor
 
@@ -589,7 +563,7 @@ Bittensor Emissions (per epoch)
     Subnet 304/105
         │
         ├─► Validators (18%)
-        │       └─► Based on stake & activity
+        │       └─► Based on activity
         │
         └─► Orchestrators (82%)
                 └─► Based on validator weights
@@ -599,9 +573,8 @@ Bittensor Emissions (per epoch)
 
 1. **Maintain high uptime** (99%+)
 2. **Keep validator software updated**
-3. **Stake more TAO** (increases weight influence)
-4. **Fast, reliable network** (better spot check success)
-5. **Monitor and respond quickly** to issues
+3. **Fast, reliable network** (better spot check success)
+4. **Monitor and respond quickly** to issues
 
 ### Penalties
 
@@ -611,8 +584,6 @@ Validators can have reduced rewards for:
 - Failed cross-verification consensus
 - Manipulation attempts
 
-**Note**: Stake is NEVER slashed - only rewards are reduced.
-
 ---
 
 ## Quick Start Checklist
@@ -621,7 +592,6 @@ Validators can have reduced rewards for:
 - [ ] Python 3.10+ installed
 - [ ] Bittensor wallet created
 - [ ] Hotkey registered on subnet (304 or 105 for mainnet)
-- [ ] TAO staked to hotkey (100+ recommended)
 - [ ] Repository cloned and dependencies installed
 - [ ] `.env` configured with correct values
 - [ ] `BEAM_VALIDATOR_EXTERNAL_IP` set to your public IP
