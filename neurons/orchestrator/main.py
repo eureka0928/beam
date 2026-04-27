@@ -33,7 +33,7 @@ import socket
 import sys
 import time
 from contextlib import asynccontextmanager
-from typing import Optional
+from typing import Any, Optional
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -66,6 +66,48 @@ _core_api_ws: Optional[websockets.WebSocketClientProtocol] = None
 
 # Pending worker-list requests keyed by transfer_id.
 _worker_list_futures: dict[str, asyncio.Future] = {}
+
+
+def _coerce_worker_metric(value: Any, default: float) -> float:
+    try:
+        if value is None:
+            return default
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _normalize_worker_list(workers: list[dict[str, Any]], transfer_id: str) -> list[dict[str, Any]]:
+    normalized_workers: list[dict[str, Any]] = []
+    skipped_workers = 0
+
+    for worker in workers:
+        worker_id = worker.get("worker_id") or worker.get("workerId")
+        if not worker_id:
+            skipped_workers += 1
+            continue
+
+        normalized_workers.append({
+            **worker,
+            "worker_id": worker_id,
+            "trust_score": _coerce_worker_metric(
+                worker.get("trust_score", worker.get("trustScore")),
+                0.5,
+            ),
+            "bandwidth_mbps": _coerce_worker_metric(
+                worker.get("bandwidth_mbps", worker.get("bandwidthMbps")),
+                100.0,
+            ),
+        })
+
+    if skipped_workers:
+        logging.getLogger(__name__).warning(
+            "Skipped %s malformed worker entries for transfer %s",
+            skipped_workers,
+            transfer_id,
+        )
+
+    return normalized_workers
 
 
 def _sign_message(wallet, message: str) -> str:
@@ -149,44 +191,52 @@ async def _handle_transfer_assigned(
 
     log.info(f"transfer_assigned: transfer={transfer_id} chunks={chunk_start}-{chunk_end}")
 
-    # Request affiliated worker pool over WS.
-    fut: asyncio.Future = asyncio.get_event_loop().create_future()
-    _worker_list_futures[transfer_id] = fut
     try:
-        await ws.send(json.dumps({"type": "list_workers", "transfer_id": transfer_id}))
-        workers = await asyncio.wait_for(fut, timeout=10.0)
-    except asyncio.TimeoutError:
-        log.error(f"Timed out waiting for worker_list for transfer {transfer_id}")
-        _worker_list_futures.pop(transfer_id, None)
-        return
-    except Exception as e:
-        log.error(f"Failed to get worker list for transfer {transfer_id}: {e}")
-        _worker_list_futures.pop(transfer_id, None)
-        return
+        # Request affiliated worker pool over WS.
+        fut: asyncio.Future = asyncio.get_event_loop().create_future()
+        _worker_list_futures[transfer_id] = fut
+        try:
+            await ws.send(json.dumps({"type": "list_workers", "transfer_id": transfer_id}))
+            workers = await asyncio.wait_for(fut, timeout=10.0)
+        except asyncio.TimeoutError:
+            log.error(f"Timed out waiting for worker_list for transfer {transfer_id}")
+            _worker_list_futures.pop(transfer_id, None)
+            return
+        except Exception as e:
+            log.error(f"Failed to get worker list for transfer {transfer_id}: {e}")
+            _worker_list_futures.pop(transfer_id, None)
+            return
 
-    if not workers:
-        log.warning(f"No workers available for assignment {assignment_id}")
-        return
+        normalized_workers = _normalize_worker_list(workers, transfer_id)
+        if not normalized_workers:
+            log.warning(f"No compatible workers available for assignment {assignment_id}")
+            return
 
-    def sla_score(w: dict) -> float:
-        trust = float(w.get("trustScore", 0.5))
-        bw = float(w.get("bandwidthMbps", 100.0))
-        return trust * min(2.0, bw / 100.0)
+        def sla_score(worker: dict[str, Any]) -> float:
+            trust = worker["trust_score"]
+            bandwidth = worker["bandwidth_mbps"]
+            return trust * min(2.0, bandwidth / 100.0)
 
-    sorted_workers = sorted(workers, key=sla_score, reverse=True)
-    worker_ids = [w["workerId"] for w in sorted_workers]
+        sorted_workers = sorted(normalized_workers, key=sla_score, reverse=True)
+        worker_ids = [worker["worker_id"] for worker in sorted_workers]
 
-    assignments = [
-        {"chunk_index": i, "worker_id": worker_ids[i % len(worker_ids)]}
-        for i in range(chunk_start, chunk_end + 1)
-    ]
+        assignments = [
+            {"chunk_index": i, "worker_id": worker_ids[i % len(worker_ids)]}
+            for i in range(chunk_start, chunk_end + 1)
+        ]
 
-    await ws.send(json.dumps({
-        "type": "chunk_assignments",
-        "assignment_id": assignment_id,
-        "assignments": assignments,
-    }))
-    log.info(f"Sent {len(assignments)} chunk_assignments for assignment {assignment_id}")
+        await ws.send(json.dumps({
+            "type": "chunk_assignments",
+            "assignment_id": assignment_id,
+            "assignments": assignments,
+        }))
+        log.info(f"Sent {len(assignments)} chunk_assignments for assignment {assignment_id}")
+    except Exception:
+        log.exception(
+            "Failed to process transfer_assigned for transfer %s assignment %s",
+            transfer_id,
+            assignment_id,
+        )
 
 
 async def _connect_and_register_ws(settings, wallet, get_worker_count, get_balance_info=None, get_uid=None):
