@@ -4,15 +4,30 @@ Orchestrators coordinate data transfers and manage worker pools on the Beam subn
 
 ## Prerequisites
 
-- Python 3.10+
+- Python 3.10–3.12 (3.14+ not recommended — some dependencies may not support it yet)
 - Bittensor wallet with registered hotkey on the subnet
 
 ## Installation
 
+Modern systems (macOS with Homebrew Python, Ubuntu 23.04+) use an externally-managed Python environment that blocks system-wide `pip install`. Use a virtual environment:
+
 ```bash
 # From repository root
+python3 -m venv .venv
+source .venv/bin/activate
 pip install -e ".[orchestrator]"
 ```
+
+If you need a specific Python version (recommended: 3.12):
+
+```bash
+brew install python@3.12
+python3.12 -m venv .venv
+source .venv/bin/activate
+pip install -e ".[orchestrator]"
+```
+
+Activate the venv before running any orchestrator commands (`source .venv/bin/activate`).
 
 ## Quick Start
 
