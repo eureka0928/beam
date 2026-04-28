@@ -290,6 +290,8 @@ async def complete_task(
     bytes_transferred: int,
     bandwidth_mbps: float,
     duration_ms: float,
+    start_time_us: int,
+    end_time_us: int,
     chunk_hash: str = "",
     error: str = None,
 ) -> bool:
@@ -301,10 +303,24 @@ async def complete_task(
             "success": success,
             "bytes_transferred": bytes_transferred,
             "bandwidth_mbps": bandwidth_mbps,
+            "start_time_us": start_time_us,
+            "end_time_us": end_time_us,
             "latency_ms": duration_ms,
             "duration_ms": int(duration_ms),
         }
-        if chunk_hash:
+        if chunk_hash: payload["chunk_hash"] = chunk_hash
+        if error: payload["error"] = error
+        response = await client.post(
+            f"{state.api_url}/workers/tasks/complete",
+            json=payload,
+            headers={"X-Worker-Hotkey": state.wallet.hotkey.ss58_address},
+            timeout=10.0,
+        )
+        data = response.json()
+        return data.get("success", False)
+    except Exception as e:
+        print(f"[Worker] Complete task error: {e}")
+        return False
             payload["chunk_hash"] = chunk_hash
         if error:
             payload["error"] = error
@@ -651,9 +667,12 @@ async def handle_task(state: WorkerState, task: dict) -> bool:
         print(f"[Worker] Task error: {e}")
 
     # Calculate metrics
-    duration_ms = (time.time() - start_time) * 1000
+    end_time = time.time()
+    duration_ms = (end_time - start_time) * 1000
     duration_sec = duration_ms / 1000
     bandwidth_mbps = (bytes_transferred * 8 / 1_000_000) / duration_sec if duration_sec > 0 else 0
+    start_time_us = int(start_time * 1_000_000)
+    end_time_us = int(end_time * 1_000_000)
 
     # Report completion
     await complete_task(
@@ -664,6 +683,8 @@ async def handle_task(state: WorkerState, task: dict) -> bool:
         bytes_transferred=bytes_transferred,
         bandwidth_mbps=round(bandwidth_mbps, 2),
         duration_ms=round(duration_ms, 1),
+        start_time_us=start_time_us,
+        end_time_us=end_time_us,
         chunk_hash=chunk_hash,
         error=error_msg,
     )
@@ -744,6 +765,8 @@ async def ws_send_task_result(
     bytes_transferred: int,
     bandwidth_mbps: float,
     duration_ms: float,
+    start_time_us: int,
+    end_time_us: int,
     chunk_hash: str = "",
     error: str = None,
 ) -> bool:
@@ -756,6 +779,8 @@ async def ws_send_task_result(
             "success": success,
             "bytes_transferred": bytes_transferred,
             "bandwidth_mbps": bandwidth_mbps,
+            "start_time_us": start_time_us,
+            "end_time_us": end_time_us,
             "latency_ms": duration_ms,
             "duration_ms": int(duration_ms),
         }
@@ -842,13 +867,16 @@ async def handle_ws_task(state: WorkerState, websocket, task: dict) -> bool:
         error_msg = str(e)
         print(f"[Worker] [WS] Task error: {e}")
 
-    duration_ms = (time.time() - start_time) * 1000
+    end_time = time.time()
+    duration_ms = (end_time - start_time) * 1000
     duration_sec = duration_ms / 1000
     bandwidth_mbps = (bytes_transferred * 8 / 1_000_000) / duration_sec if duration_sec > 0 else 0
+    start_time_us = int(start_time * 1_000_000)
+    end_time_us = int(end_time * 1_000_000)
 
     await ws_send_task_result(
         websocket, state, task_id, success, bytes_transferred,
-        round(bandwidth_mbps, 2), round(duration_ms, 1),
+        round(bandwidth_mbps, 2), round(duration_ms, 1), start_time_us, end_time_us,
         chunk_hash=chunk_hash, error=error_msg,
     )
 
@@ -859,6 +887,8 @@ async def handle_ws_task(state: WorkerState, websocket, task: dict) -> bool:
 
     status = "OK" if success else f"FAIL: {error_msg}"
     print(f"[Worker] [WS] Task {task_id[:16]}: {status} | {bytes_transferred} bytes | {bandwidth_mbps:.1f} Mbps")
+
+    return success
 
     return success
 
