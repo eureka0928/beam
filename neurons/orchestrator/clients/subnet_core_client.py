@@ -1624,6 +1624,9 @@ class SubnetCoreClient:
             return response.json()
 
         except httpx.HTTPStatusError as e:
+            if e.response.status_code == 404:
+                logger.debug(f"No epoch payments found on BeamCore for epoch {epoch}")
+                return {"epoch": epoch, "count": 0, "payments": []}
             logger.error(f"HTTP error getting epoch payments: {e.response.status_code}")
             raise
         except Exception as e:

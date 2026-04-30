@@ -46,7 +46,11 @@ import httpx
 
 try:
     import websockets
-    from websockets.exceptions import ConnectionClosed, InvalidStatusCode
+    from websockets.exceptions import ConnectionClosed
+    try:
+        from websockets.exceptions import InvalidStatus
+    except ImportError:
+        from websockets.exceptions import InvalidStatusCode as InvalidStatus
     WEBSOCKETS_AVAILABLE = True
 except ImportError:
     WEBSOCKETS_AVAILABLE = False
@@ -113,6 +117,8 @@ class WorkerState:
     use_websocket: bool = True
     pending_probe_id: Optional[str] = None
     pending_task_accepts: Dict[str, asyncio.Future] = field(default_factory=dict)
+    active_ws_task_ids: set[str] = field(default_factory=set)
+    ws_task_handles: set[asyncio.Task] = field(default_factory=set)
 
 
 # =============================================================================
@@ -804,6 +810,23 @@ async def ws_send_task_result(
         return False
 
 
+def track_ws_task(state: WorkerState, coro: asyncio.coroutines) -> None:
+    """Track spawned WS task handlers so they are not dropped on loop exit."""
+    task = asyncio.create_task(coro)
+    state.ws_task_handles.add(task)
+
+    def _on_done(done_task: asyncio.Task) -> None:
+        state.ws_task_handles.discard(done_task)
+        try:
+            exc = done_task.exception()
+        except asyncio.CancelledError:
+            return
+        if exc is not None:
+            print(f"[Worker] [WS] Task handler crashed: {type(exc).__name__}: {exc}")
+
+    task.add_done_callback(_on_done)
+
+
 async def handle_ws_task(state: WorkerState, websocket, task: dict) -> bool:
     """Handle a task received via WebSocket push."""
     task_id = task.get("task_id") or task.get("offer_id")
@@ -812,92 +835,103 @@ async def handle_ws_task(state: WorkerState, websocket, task: dict) -> bool:
     execution_context = task.get("execution_context", {})
 
     print(f"[Worker] [WS] Task: {task_id[:16] if task_id else 'unknown'}...")
-
-    gateway_url = execution_context.get("gateway_url")
-    destination_url = execution_context.get("destination_url")
-    source_urls = execution_context.get("source_urls")
-    dest_urls = execution_context.get("dest_urls")
-
-    if not (gateway_url and destination_url) and not (source_urls and dest_urls):
-        print(f"[Worker] [WS] Skipping task: missing gateway_url/destination_url and no presigned URLs")
+    if not task_id:
+        print(f"[Worker] [WS] Skipping task: missing task_id")
         return False
-
-    if deadline_us > 0:
-        now_us = time.time() * 1_000_000
-        remaining_sec = (deadline_us - now_us) / 1_000_000
-        if remaining_sec < 5:
-            print(f"[Worker] [WS] Skipping task: deadline too close ({remaining_sec:.1f}s)")
-            return False
-
-    # Register a future to wait for the server's accept ack before executing
-    accept_future: asyncio.Future = asyncio.get_event_loop().create_future()
-    state.pending_task_accepts[task_id] = accept_future
-
-    accepted = await ws_send_task_accept(websocket, state, task_id)
-    if not accepted:
-        state.pending_task_accepts.pop(task_id, None)
-        print(f"[Worker] [WS] Failed to send task accept")
+    if task_id in state.active_ws_task_ids:
+        print(f"[Worker] [WS] Duplicate task offer ignored: {task_id[:16]}")
         return False
-
-    # Wait for server confirmation (5s timeout — proceed on timeout to avoid stalling)
-    try:
-        server_accepted = await asyncio.wait_for(accept_future, timeout=5.0)
-        if not server_accepted:
-            print(f"[Worker] [WS] Task accept rejected by server")
-            return False
-    except asyncio.TimeoutError:
-        state.pending_task_accepts.pop(task_id, None)
-        print(f"[Worker] [WS] Accept ack timeout, proceeding")
-
-    state.active_tasks += 1
-    start_time = time.time()
-    success = False
-    bytes_transferred = 0
-    error_msg = None
-    chunk_hash = ""
+    state.active_ws_task_ids.add(task_id)
 
     try:
-        async with task_semaphore:
-            if deadline_us > 0:
-                now_us = time.time() * 1_000_000
-                remaining_sec = (deadline_us - now_us) / 1_000_000
-                if remaining_sec < 2:
-                    error_msg = f"Deadline expired while waiting ({remaining_sec:.1f}s)"
-                    print(f"[Worker] [WS] {error_msg}")
+        gateway_url = execution_context.get("gateway_url")
+        destination_url = execution_context.get("destination_url")
+        source_urls = execution_context.get("source_urls")
+        dest_urls = execution_context.get("dest_urls")
+
+        if not (gateway_url and destination_url) and not (source_urls and dest_urls):
+            print(f"[Worker] [WS] Skipping task: missing gateway_url/destination_url and no presigned URLs")
+            return False
+
+        if deadline_us > 0:
+            now_us = time.time() * 1_000_000
+            remaining_sec = (deadline_us - now_us) / 1_000_000
+            if remaining_sec < 5:
+                print(f"[Worker] [WS] Skipping task: deadline too close ({remaining_sec:.1f}s)")
+                return False
+
+        # Register a future to wait for the server's accept ack before executing
+        accept_future: asyncio.Future = asyncio.get_event_loop().create_future()
+        state.pending_task_accepts[task_id] = accept_future
+
+        accepted = await ws_send_task_accept(websocket, state, task_id)
+        if not accepted:
+            state.pending_task_accepts.pop(task_id, None)
+            print(f"[Worker] [WS] Failed to send task accept")
+            return False
+
+        # Wait for server confirmation (5s timeout — proceed on timeout to avoid stalling)
+        try:
+            server_accepted = await asyncio.wait_for(accept_future, timeout=5.0)
+            if not server_accepted:
+                print(f"[Worker] [WS] Task accept rejected by server")
+                return False
+        except asyncio.TimeoutError:
+            state.pending_task_accepts.pop(task_id, None)
+            print(f"[Worker] [WS] Accept ack timeout, proceeding")
+
+        state.active_tasks += 1
+        start_time = time.time()
+        success = False
+        bytes_transferred = 0
+        error_msg = None
+        chunk_hash = ""
+
+        try:
+            async with task_semaphore:
+                if deadline_us > 0:
+                    now_us = time.time() * 1_000_000
+                    remaining_sec = (deadline_us - now_us) / 1_000_000
+                    if remaining_sec < 2:
+                        error_msg = f"Deadline expired while waiting ({remaining_sec:.1f}s)"
+                        print(f"[Worker] [WS] {error_msg}")
+                    else:
+                        bytes_transferred, success, error_msg, chunk_hash = await execute_transfer(
+                            state, task_id, execution_context, task, deadline_us
+                        )
                 else:
                     bytes_transferred, success, error_msg, chunk_hash = await execute_transfer(
                         state, task_id, execution_context, task, deadline_us
                     )
-            else:
-                bytes_transferred, success, error_msg, chunk_hash = await execute_transfer(
-                    state, task_id, execution_context, task, deadline_us
-                )
-    except Exception as e:
-        error_msg = str(e)
-        print(f"[Worker] [WS] Task error: {e}")
+        except Exception as e:
+            error_msg = str(e)
+            print(f"[Worker] [WS] Task error: {e}")
 
-    end_time = time.time()
-    duration_ms = (end_time - start_time) * 1000
-    duration_sec = duration_ms / 1000
-    bandwidth_mbps = (bytes_transferred * 8 / 1_000_000) / duration_sec if duration_sec > 0 else 0
-    start_time_us = int(start_time * 1_000_000)
-    end_time_us = int(end_time * 1_000_000)
+        end_time = time.time()
+        duration_ms = (end_time - start_time) * 1000
+        duration_sec = duration_ms / 1000
+        bandwidth_mbps = (bytes_transferred * 8 / 1_000_000) / duration_sec if duration_sec > 0 else 0
+        start_time_us = int(start_time * 1_000_000)
+        end_time_us = int(end_time * 1_000_000)
 
-    await ws_send_task_result(
-        websocket, state, task_id, success, bytes_transferred,
-        round(bandwidth_mbps, 2), round(duration_ms, 1), start_time_us, end_time_us,
-        chunk_hash=chunk_hash, error=error_msg,
-    )
+        await ws_send_task_result(
+            websocket, state, task_id, success, bytes_transferred,
+            round(bandwidth_mbps, 2), round(duration_ms, 1), start_time_us, end_time_us,
+            chunk_hash=chunk_hash, error=error_msg,
+        )
 
-    if success:
-        state.bytes_relayed += bytes_transferred
+        if success:
+            state.bytes_relayed += bytes_transferred
 
-    state.active_tasks -= 1
+        state.active_tasks -= 1
 
-    status = "OK" if success else f"FAIL: {error_msg}"
-    print(f"[Worker] [WS] Task {task_id[:16]}: {status} | {bytes_transferred} bytes | {bandwidth_mbps:.1f} Mbps")
+        status = "OK" if success else f"FAIL: {error_msg}"
+        print(f"[Worker] [WS] Task {task_id[:16]}: {status} | {bytes_transferred} bytes | {bandwidth_mbps:.1f} Mbps")
 
-    return success
+        return success
+    finally:
+        state.pending_task_accepts.pop(task_id, None)
+        state.active_ws_task_ids.discard(task_id)
 
 async def websocket_loop(state: WorkerState):
     """WebSocket communication loop with automatic reconnection."""
@@ -955,7 +989,7 @@ async def websocket_loop(state: WorkerState):
                                         await websocket.send(json.dumps(bw_response))
 
                             elif msg_type == "task_offer":
-                                asyncio.create_task(handle_ws_task(state, websocket, message))
+                                track_ws_task(state, handle_ws_task(state, websocket, message))
 
                             elif msg_type == "task_accept_ack":
                                 ack_task_id = message.get("task_id") or message.get("offer_id")
@@ -985,7 +1019,7 @@ async def websocket_loop(state: WorkerState):
                         print(f"[Worker] [WS] Connection closed: {e.code} {e.reason}")
                         break
 
-        except InvalidStatusCode as e:
+        except InvalidStatus as e:
             print(f"[Worker] [WS] Connection rejected: HTTP {e.status_code}")
             if e.status_code == 4001:
                 print(f"[Worker] [WS] Server has WebSocket disabled, falling back to HTTP polling")
@@ -1131,6 +1165,9 @@ async def run_worker(state: WorkerState):
         print(f"[Worker] Error: {e}")
         raise
     finally:
+        if state.ws_task_handles:
+            print(f"[Worker] Waiting for {len(state.ws_task_handles)} active WS task(s) to finish")
+            await asyncio.gather(*list(state.ws_task_handles), return_exceptions=True)
         if state.http_client:
             await state.http_client.aclose()
             state.http_client = None
