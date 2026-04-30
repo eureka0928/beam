@@ -519,17 +519,26 @@ class WorkerManager:
                     existing.total_tasks = w.get("total_tasks", existing.total_tasks)
                     existing.bytes_relayed_total = w.get("bytes_relayed_total", existing.bytes_relayed_total)
                     existing.global_pending_tasks = w.get("pending_tasks", 0)  # Global task count from BeamCore
+                    # BeamCore 24h signals
+                    existing.delivery_ratio = w.get("delivery_ratio", existing.delivery_ratio)
+                    existing.latency_p50_ms = w.get("latency_p50_ms", existing.latency_p50_ms)
+                    existing.reputation_score = w.get("reputation_score", existing.reputation_score)
+                    existing.failure_reasons = dict(w.get("failure_reasons", existing.failure_reasons) or {})
+                    if w.get("ip"):
+                        existing.ip = w["ip"]
+                    if w.get("region"):
+                        existing.region = w["region"]
                     existing.last_seen = datetime.utcnow()
                     if existing.status == WorkerStatus.OFFLINE:
                         existing.status = WorkerStatus.ACTIVE
                 else:
-                    # Add new worker to cache (anonymous - no hotkey/ip/port/region)
+                    # Add new worker to cache (BeamCore may provide ip/region now)
                     worker = Worker(
                         worker_id=worker_id,
                         hotkey="",  # Anonymous - not provided by SubnetCore
-                        ip="0.0.0.0",  # Anonymous
+                        ip=w.get("ip", "0.0.0.0"),
                         port=0,  # Anonymous
-                        region="unknown",  # Anonymous
+                        region=w.get("region", "unknown"),
                         bandwidth_mbps=w.get("bandwidth_mbps", 0.0),
                         status=WorkerStatus.ACTIVE,
                         trust_score=w.get("trust_score", 0.5),
@@ -537,9 +546,12 @@ class WorkerManager:
                         total_tasks=w.get("total_tasks", 0),
                         bytes_relayed_total=w.get("bytes_relayed_total", 0),
                         global_pending_tasks=w.get("pending_tasks", 0),  # Global task count from BeamCore
+                        delivery_ratio=w.get("delivery_ratio", 0.7),
+                        latency_p50_ms=w.get("latency_p50_ms", 500.0),
+                        reputation_score=w.get("reputation_score", 0.5),
+                        failure_reasons=dict(w.get("failure_reasons", {}) or {}),
                     )
                     self.workers[worker_id] = worker
-                    # No hotkey/region indexing since anonymous
 
                 synced += 1
 

@@ -572,6 +572,22 @@ class SubnetCoreClient:
             f"heartbeat={heartbeat_interval}s, fallback_transfer_poll={safe_transfer_poll_interval}s"
         )
 
+    async def force_ws_reconnect(self) -> None:
+        """Close the active WS connection so the reconnect loop reopens it.
+
+        Used by the health watchdog when we detect a "zombie" state — WS
+        appears connected but no transfers are arriving despite a positive
+        BeamCore allocation. The _ws_connection_loop will pick up and
+        reopen since self._running stays True.
+        """
+        if not self._ws:
+            return
+        try:
+            await self._ws.close()
+            logger.warning("Forced WS reconnect (health watchdog)")
+        except Exception as e:
+            logger.warning(f"force_ws_reconnect: close failed: {e}")
+
     async def stop_polling(self):
         """Stop WebSocket connection and heartbeat loop."""
         self._running = False
@@ -1862,6 +1878,11 @@ class SubnetCoreClient:
             return result
 
         except httpx.HTTPStatusError as e:
+            # 500 on this endpoint is a known BeamCore-side issue for some epochs.
+            # Don't raise — caller already logs and continues, raising adds no value.
+            if e.response.status_code == 500:
+                logger.debug(f"BeamCore 500 on /payments/epoch (known issue, ignored): epoch={payment.epoch}")
+                return {}
             logger.error(f"HTTP error recording epoch payment: {e.response.status_code}")
             raise
         except Exception as e:

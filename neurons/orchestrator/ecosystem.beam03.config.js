@@ -29,6 +29,7 @@ module.exports = {
       ALPHA_PER_CHUNK: '0.5',
       READY: 'true',
       DATABASE_URL: 'postgresql+asyncpg://beam:beam123@localhost:5432/beam_orchestrator',
+      BEAMCORE_API_KEY: 'b1m_409081404181f9bd3dcf97e6c615a648e732936f802518ba',
     }
   }]
 };

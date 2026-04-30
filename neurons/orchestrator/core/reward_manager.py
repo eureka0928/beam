@@ -172,27 +172,37 @@ class RewardManager:
             logger.warning(f"No transfer_id for {task_id[:16]}... — skip")
             return None
 
-        # Resolve worker coldkey: prefer payment-address API's worker_id, fallback to proof
+        # Resolve worker coldkey.
+        # The proof's worker_id is the ACTUAL completer; payment-address API has been
+        # observed to return a different worker_id for the same task, which causes
+        # "Recipient mismatch" on verification. Prefer the proof, use payment-address
+        # only as a fallback when proof has no worker_id.
         pa_worker_id = ""
         if isinstance(payment_info, dict):
             pa_worker_id = payment_info.get("worker_id", "")
+        if pa_worker_id and worker_id and pa_worker_id != worker_id:
+            logger.warning(
+                f"payment-address worker_id mismatch for {task_id[:16]}...: "
+                f"proof={worker_id} vs payment-address={pa_worker_id} — trusting proof"
+            )
 
+        resolve_id = worker_id or pa_worker_id
         payment_dest = None
         # Check cache first
-        cache_key = pa_worker_id or worker_id
-        if cache_key and cache_key in self._coldkey_cache:
+        if resolve_id and resolve_id in self._coldkey_cache:
             cached_ts = self._coldkey_cache_ts
             if time.time() - cached_ts < self._coldkey_cache_ttl:
-                payment_dest = self._coldkey_cache.get(cache_key)
+                payment_dest = self._coldkey_cache.get(resolve_id)
 
         if not payment_dest:
             try:
-                if pa_worker_id:
+                if resolve_id:
+                    payment_dest = await subnet_core_client.get_worker_coldkey(resolve_id)
+                # Last resort: try payment-address's worker_id if it differed
+                if not payment_dest and pa_worker_id and pa_worker_id != resolve_id:
                     payment_dest = await subnet_core_client.get_worker_coldkey(pa_worker_id)
-                if not payment_dest and worker_id:
-                    payment_dest = await subnet_core_client.get_worker_coldkey(worker_id)
-                if payment_dest and cache_key:
-                    self._coldkey_cache[cache_key] = payment_dest
+                if payment_dest and resolve_id:
+                    self._coldkey_cache[resolve_id] = payment_dest
                     self._coldkey_cache_ts = time.time()
             except Exception as e:
                 logger.warning(f"Worker coldkey lookup failed for {task_id[:16]}...: {e}")

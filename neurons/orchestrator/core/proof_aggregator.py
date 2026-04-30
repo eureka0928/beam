@@ -207,7 +207,19 @@ class ProofAggregator:
                 self._failed_publishes.append((pob, 0))
 
     async def _try_publish_pob(self, client, pob, is_retry: bool = False) -> bool:
-        """Attempt to publish a single PoB to SubnetCore. Returns True on success."""
+        """Attempt to publish a single PoB to SubnetCore.
+
+        Returns True on success or truly-permanent failure.
+        Returns False on transient failure so caller retries later.
+
+        "Chunk hash mismatch" 400s are treated as transient: BeamCore currently
+        compares PoB chunk_hash against a server-side reference that has been
+        observed stuck on a single sentinel value across unrelated tasks
+        (see report: expected-prefix identical across 100+ rejects). Keeping
+        these retryable means the backlog auto-recovers the moment BeamCore
+        fixes its reference hash — instead of us dropping every proof silently.
+        Other 400s (bad signature, malformed payload) stay permanent.
+        """
         try:
             await client.publish_pob(pob)
             self._publish_success_count += 1
@@ -216,6 +228,15 @@ class ProofAggregator:
             return True
         except Exception as e:
             self._publish_failure_count += 1
+            error_str = str(e)
+            is_400 = "400" in error_str or "Bad Request" in error_str
+            is_chunk_hash_mismatch = "chunk hash mismatch" in error_str.lower()
+
+            if is_400 and not is_chunk_hash_mismatch:
+                logger.error(f"PoB publish permanently rejected for {pob.task_id[:16]}...: {e}")
+                return True  # Permanent — remove from retry queue
+
+            # Transient (including chunk-hash-mismatch 400s): retry later.
             level = logging.ERROR if self._publish_failure_count > 3 else logging.WARNING
             logger.log(
                 level,
@@ -234,11 +255,15 @@ class ProofAggregator:
         self._failed_publishes = self._failed_publishes[batch_size:]
 
         still_failed = []
+        # Retry cap: at proof_aggregation_interval=15s, 5760 retries ≈ 24h.
+        # BeamCore-side chunk-hash reference bugs can take hours/days to fix;
+        # giving up at 5 retries (75s) means we lose the whole epoch's backlog.
+        MAX_RETRIES = 5760
         for pob, retry_count in to_retry:
-            if retry_count >= 5:
+            if retry_count >= MAX_RETRIES:
                 logger.error(
-                    f"PoB publish permanently failed after 5 retries: {pob.task_id[:16]}... "
-                    f"({pob.bytes_relayed} bytes, epoch {pob.epoch})"
+                    f"PoB publish permanently failed after {MAX_RETRIES} retries: "
+                    f"{pob.task_id[:16]}... ({pob.bytes_relayed} bytes, epoch {pob.epoch})"
                 )
                 continue
             success = await self._try_publish_pob(subnet_core_client, pob, is_retry=True)

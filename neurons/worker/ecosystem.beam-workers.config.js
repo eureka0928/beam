@@ -1,12 +1,16 @@
-// 5 workers affiliated with UID 102 (beam-04)
+// 5 workers affiliated with UIDs 102, 104, 226 (skipping 69 — sla decayed to 0.01 floor)
 const COMMON_ENV = {
   SUBNET_CORE_URL: 'https://beamcore.b1m.ai',
   BEAM_WORKER_REGION: 'US',
   CONNECTION_MODE: 'auto',
   BT_WALLET_PASSWORD: 'beam-01',
   BEAM_WORKER_STAGGER: '5',
-  BEAM_ORCHESTRATOR_HOTKEYS: '5HZELQTGxn92kZcupRfrpn45qxeu83S1pmsiwoLKGyESSeH3',  // UID 102
-  BEAM_ORCHESTRATOR_API_KEY: 'b1m_61daf8fedb627b79c12f0a0a100e92cda01104e8ba083d2e',
+  BEAM_ORCHESTRATOR_HOTKEYS: [
+    '5HZELQTGxn92kZcupRfrpn45qxeu83S1pmsiwoLKGyESSeH3',  // UID 102
+    '5Eh2KCFgfic6gS5XQ4zBwhfstC1s8cduwkka1Qe3ot91mt55',  // UID 104
+    '5E6kGMZ4Vewcov7SYfMeZtj3dznfTznKceuZVvYUz8kmK6cn',  // UID 226
+  ].join(','),
+  BEAM_ORCHESTRATOR_API_KEY: 'b1m_ce5ad0028c626900876ed5a23b9ea8cfa9e74265dd2f28c1',
 };
 
 const COMMON = {

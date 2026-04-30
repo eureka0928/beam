@@ -180,6 +180,21 @@ class OrchestratorSettings(BaseSettings):
     weight_success: float = Field(default=0.15, env="WEIGHT_SUCCESS")
 
     # ==========================================================================
+    # Worker Scoring Engine (consumes BeamCore 24h signals)
+    # ==========================================================================
+    worker_scorer_enabled: bool = Field(default=True, env="WORKER_SCORER_ENABLED")
+    worker_scorer_zero_bytes_threshold: int = Field(
+        default=3, env="WORKER_SCORER_ZERO_BYTES_THRESHOLD"
+    )
+    worker_scorer_rejected_threshold: int = Field(
+        default=20, env="WORKER_SCORER_REJECTED_THRESHOLD"
+    )
+    worker_scorer_affiliated_mult: float = Field(
+        default=1.15, env="WORKER_SCORER_AFFILIATED_MULT"
+    )
+    worker_scorer_explore_c: float = Field(default=0.15, env="WORKER_SCORER_EXPLORE_C")
+
+    # ==========================================================================
     # Reward Distribution Weights (for epoch-end payment calculation)
     # ==========================================================================
     # Primary factor: bytes relayed (work done)

@@ -113,6 +113,20 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 
+def _classify_failure_reason(reason: str) -> str:
+    """Map a failure reason string to one of the scorer failure-kind buckets."""
+    r = (reason or "").lower()
+    if "hash" in r:
+        return "hash_mismatch"
+    if "zero" in r or "0 bytes" in r:
+        return "zero_bytes"
+    if "timeout" in r or "expired" in r or "deadline" in r:
+        return "timeout"
+    if "reject" in r:
+        return "rejected"
+    return "worker_error"
+
+
 # =============================================================================
 # Data Models
 # =============================================================================
@@ -171,6 +185,12 @@ class Worker:
     # Trust scoring
     trust_score: float = 0.5  # Starts at neutral
     fraud_score: float = 0.0  # Higher = more suspicious
+
+    # BeamCore 24h signals (populated by sync_workers_from_subnetcore)
+    delivery_ratio: float = 0.7
+    latency_p50_ms: float = 500.0
+    reputation_score: float = 0.5
+    failure_reasons: Dict[str, int] = field(default_factory=dict)
 
     # Reward tracking
     rewards_earned_epoch: int = 0
@@ -389,6 +409,28 @@ class Orchestrator:
         self._proof_agg = ProofAggregator(self.settings)
         self._reward_mgr = RewardManager(self.settings)
         self._epoch_mgr = EpochManager(self.settings)
+
+        # --- Worker scoring engine ---
+        from .worker_scorer import LocalFailureTracker, WorkerScorer
+        self._failure_tracker = LocalFailureTracker()
+        self._scorer = WorkerScorer(self.settings, self._failure_tracker)
+        self._epoch_assignments: int = 0
+        # Health watchdog: track wall-clock of last transfer arrival so we can
+        # detect "zombie" states where WS appears alive but BeamCore stops
+        # routing chunks to us. Initialize to startup time so we don't
+        # immediately trip on first launch.
+        self._last_transfer_received_at: float = time.time()
+        # API-driven worker intelligence: IP-correlation poisoning + stagnation
+        # detection. Refreshed by _worker_intel_loop every 5 min.
+        from .worker_intel import WorkerIntel
+        from .worker_scorer import _poison_write
+        self._worker_intel = WorkerIntel(
+            list_workers_fn=self._intel_list_workers,
+            poison_fn=_poison_write,
+        )
+        self._failure_tracker.set_ip_sibling_poison_cb(
+            self._worker_intel.poison_ip_siblings
+        )
         # BlindWorkerManager removed
         # GatewayManager removed
 
@@ -576,7 +618,12 @@ class Orchestrator:
             )),
             # Removed: validator_report_loop - BeamCore handles PoB centrally, validators read from BeamCore
             asyncio.create_task(self._epoch_management_loop()),
-            # Removed: _stale_task_reassignment_loop - deprecated endpoint replaced by WebSocket push
+            # Stale-task polling endpoint returns 410 Gone on BeamCore.
+            # Timeouts are captured via fail_task() instead, which feeds the
+            # scorer's local timeout overlay for hard-exclude on reassignment.
+            asyncio.create_task(self._stuck_task_watchdog_loop()),
+            asyncio.create_task(self._health_watchdog_loop()),
+            asyncio.create_task(self._worker_intel_loop()),
         ]
         logger.info("Worker sync loop started (syncs from SubnetCore every 60s)")
 
@@ -909,6 +956,7 @@ class Orchestrator:
             if worker:
                 worker.failed_tasks += 1
                 worker.update_success_rate()
+            self._failure_tracker.record(worker_id, "worker_error")
             return None
 
         # Update worker stats (only if worker is in memory)
@@ -1013,23 +1061,239 @@ class Orchestrator:
         )
         return proof
 
+    async def _health_watchdog_loop(self) -> None:
+        """Force WS reconnect when we appear "zombie".
+
+        A zombie orchestrator is one where the WS handshake succeeded long
+        ago but BeamCore has stopped pushing transfers — the connection
+        looks healthy at the socket level (heartbeats fine) but no chunks
+        arrive despite a positive BeamCore allocation. We saw a 16h zombie
+        window in prod that cost an entire epoch's emission.
+
+        Strategy: every 5 min, check `time.time() - last_transfer_received`.
+        If > 30 min AND BeamCore says we have at least 1 allocated chunk,
+        close the WS to force the reconnect loop to re-register us.
+        """
+        poll_s = 300
+        zombie_threshold_s = 1800   # 30 min — generous enough that a quiet
+                                    # period during real subnet downtime
+                                    # doesn't trigger reconnect storms.
+        logger.info(f"Health watchdog started (poll={poll_s}s zombie_threshold={zombie_threshold_s}s)")
+        while self._running:
+            try:
+                await asyncio.sleep(poll_s)
+                if not self.subnet_core_client:
+                    continue
+                idle_s = time.time() - self._last_transfer_received_at
+                if idle_s < zombie_threshold_s:
+                    continue
+                # Only force reconnect if BeamCore says we have allocation.
+                # Without this check, we'd reconnect every 5 min during
+                # genuine subnet quiet periods.
+                allocated = await self._beamcore_allocation_chunks()
+                if allocated <= 0:
+                    logger.info(
+                        f"health watchdog: idle={idle_s:.0f}s but allocation=0; "
+                        f"subnet quiet, no reconnect"
+                    )
+                    continue
+                logger.error(
+                    f"ZOMBIE detected: no transfers in {idle_s:.0f}s but BeamCore "
+                    f"allocation={allocated}. Forcing WS reconnect."
+                )
+                try:
+                    await self.subnet_core_client.force_ws_reconnect()
+                    # Reset so we don't reconnect again in the next 30 min
+                    # before the new connection has had a chance to deliver.
+                    self._last_transfer_received_at = time.time()
+                except Exception as e:
+                    logger.error(f"health watchdog: reconnect failed: {e}")
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"Health watchdog error: {e}")
+
+    async def _beamcore_allocation_chunks(self) -> int:
+        """Return our allocated chunks from BeamCore traffic-allocation.
+
+        Returns 0 if endpoint unreachable or our UID isn't in the list.
+        Used by the health watchdog to distinguish "we're zombied" from
+        "subnet is quiet."
+        """
+        try:
+            import httpx
+            async with httpx.AsyncClient(timeout=10) as c:
+                r = await c.get("https://beamcore.b1m.ai/dashboard/api/traffic-allocation")
+                if r.status_code != 200:
+                    return 0
+                allocs = r.json().get("allocations", [])
+                our_uid = getattr(self, "our_uid", None)
+                if our_uid is None:
+                    return 0
+                for a in allocs:
+                    if a.get("uid") == our_uid:
+                        return int(a.get("chunks", 0))
+        except Exception as e:
+            logger.debug(f"_beamcore_allocation_chunks failed: {e}")
+        return 0
+
+    async def _intel_list_workers(self) -> List[Dict[str, Any]]:
+        """List workers for WorkerIntel (full BeamCore /orchestrators/workers)."""
+        if not self.subnet_core_client:
+            return []
+        try:
+            body = await self.subnet_core_client.list_workers(status="active")
+            return body.get("workers", []) if isinstance(body, dict) else (body or [])
+        except Exception as e:
+            logger.debug(f"_intel_list_workers failed: {e}")
+            return []
+
+    async def _worker_intel_loop(self) -> None:
+        """Refresh worker intel every 5 min (IP map + total_tasks history).
+
+        Each refresh: rebuilds IP↔workers map for IP-correlation poisoning,
+        appends total_tasks/pending_tasks samples to history, then scans for
+        stagnant workers (≥1 pending tasks for ≥1h with zero total_tasks
+        growth). Stagnant workers get poisoned for 24h via the shared file.
+        """
+        poll_s = 300
+        logger.info(f"Worker intel loop started (poll={poll_s}s)")
+        # First refresh ASAP so IP map is populated before any failure events.
+        await asyncio.sleep(15)
+        try:
+            await self._worker_intel.refresh()
+        except Exception as e:
+            logger.error(f"Worker intel initial refresh failed: {e}")
+        while self._running:
+            try:
+                await asyncio.sleep(poll_s)
+                await self._worker_intel.refresh()
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"Worker intel loop error: {e}")
+
+    async def _stuck_task_watchdog_loop(self) -> None:
+        """Locally fail tasks past their deadline.
+
+        BeamCore's `/orchestrators/tasks/stale` endpoint returns 410 Gone, so
+        we self-detect stuck tasks. Every poll, scan self.active_tasks; any
+        task whose deadline_us has elapsed (plus grace_s buffer) gets failed
+        with kind "stale_timeout". That feeds:
+          - LocalFailureTracker — short-term scorer overlay
+          - poison file — sibling-orch hard-exclude (24h)
+          - auto-blacklist — permanent after BLACKLIST_AUTO_FAILURES events
+        Without this loop, a worker that accepts a chunk and goes silent
+        sits in active_tasks until process restart; this is the pattern that
+        zeroed our incentive after worker_ecd3f046d03b dropped chunk 43.
+        """
+        poll_s = 30
+        grace_s = 30
+        logger.info(f"Stuck task watchdog started (poll={poll_s}s grace={grace_s}s)")
+        while self._running:
+            try:
+                await asyncio.sleep(poll_s)
+                now_us = int(time.time() * 1_000_000)
+                grace_us = grace_s * 1_000_000
+                stuck = []
+                for task_id, task in list(self.active_tasks.items()):
+                    if task.status in ("completed", "failed"):
+                        continue
+                    if task.deadline_us and now_us > task.deadline_us + grace_us:
+                        stuck.append((task_id, task.worker_id))
+                if stuck:
+                    logger.warning(
+                        f"Stuck task watchdog: failing {len(stuck)} tasks past deadline "
+                        f"(workers: {sorted({w for _, w in stuck if w})})"
+                    )
+                    for task_id, _ in stuck:
+                        try:
+                            await self.fail_task(task_id, "stale_timeout")
+                        except Exception as e:
+                            logger.error(f"watchdog: fail_task({task_id[:16]}) failed: {e}")
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"Stuck task watchdog error: {e}")
+
     async def fail_task(self, task_id: str, reason: str) -> None:
-        """Record task failure."""
+        """Record task failure and attempt local reassignment.
+
+        For recoverable failure kinds (stale_timeout, worker_error, timeout),
+        immediately try to reassign the chunk to a different worker via
+        `_select_worker_for_reassignment` + BeamCore's reassign_task API.
+        Skipped for hash_mismatch (chunk data is bad — different worker
+        wouldn't help) and zero_bytes (worker delivered but empty — same
+        underlying request).
+
+        Without this retry, BeamCore's stale-detection endpoint is 410 Gone
+        so a failed chunk just gets dropped, costing exposure share.
+        """
         task = self.active_tasks.get(task_id)
         if not task:
             return
 
         worker = self.workers.get(task.worker_id)
+        kind = _classify_failure_reason(reason)
+        original_worker_id = task.worker_id
+
         if worker:
             worker.active_tasks = max(0, worker.active_tasks - 1)
             worker.failed_tasks += 1
             worker.update_success_rate()
             worker.trust_score = max(0.0, worker.trust_score - 0.01)
+            self._failure_tracker.record(worker.worker_id, kind)
+            # Timeouts also get a hard-exclude marker: scorer's
+            # had_recent_timeout() short-circuits assignment for
+            # LOCAL_TIMEOUT_TTL (default 180s) so the same worker isn't
+            # re-chosen for the next chunk on this or an adjacent transfer.
+            if kind == "timeout":
+                self._failure_tracker.record(worker.worker_id, "stale_timeout")
 
         task.status = "failed"
         del self.active_tasks[task_id]
 
         logger.warning(f"Task {task_id[:16]}... failed: {reason}")
+
+        # Attempt local reassignment for recoverable kinds.
+        if kind in ("stale_timeout", "timeout", "worker_error"):
+            try:
+                await self._try_local_reassign(task_id, original_worker_id)
+            except Exception as e:
+                logger.warning(f"local reassign for {task_id[:16]}... raised: {e}")
+
+    async def _try_local_reassign(self, task_id: str, exclude_worker_id: Optional[str]) -> None:
+        """Pick the next-best worker via the scorer and call reassign_task.
+
+        No-op if no subnet_core_client, no live workers, or no clean
+        candidate. Logs at INFO on success, WARN on no-candidate, ERROR
+        on API failure.
+        """
+        if not self.subnet_core_client:
+            return
+        try:
+            workers_response = await self.subnet_core_client.list_workers(status="active")
+            all_workers = workers_response.get("workers", [])
+        except Exception as e:
+            logger.debug(f"reassign: list_workers failed: {e}")
+            return
+        live = self._filter_workers_with_recent_heartbeat(all_workers, max_age_seconds=60)
+        if not live:
+            logger.warning(f"reassign {task_id[:16]}...: no live workers")
+            return
+        new_worker = self._select_worker_for_reassignment(live, exclude_worker_id=exclude_worker_id)
+        if not new_worker:
+            logger.warning(f"reassign {task_id[:16]}...: scorer found no clean candidate")
+            return
+        new_worker_id = new_worker.get("worker_id")
+        try:
+            await self.subnet_core_client.reassign_task(task_id, new_worker_id)
+            logger.info(
+                f"Locally reassigned {task_id[:16]}... "
+                f"from {(exclude_worker_id or '?')[:16]}... to {new_worker_id[:16]}..."
+            )
+        except Exception as e:
+            logger.error(f"reassign_task API failed for {task_id[:16]}...: {e}")
 
     # =========================================================================
     # Payment Self-Limiting
@@ -1422,6 +1686,14 @@ class Orchestrator:
                     if not task_id:
                         continue
 
+                    # Record stale-task event in local overlay so the scorer
+                    # hard-excludes this worker from the next few minutes.
+                    # Distinct kind (`stale_timeout`) from the soft-overlay
+                    # `timeout` kind so it produces a hard exclude rather
+                    # than a 0.5× soft penalty.
+                    if current_worker_id:
+                        self._failure_tracker.record(current_worker_id, "stale_timeout")
+
                     # Select a new worker (different from the current/failed one)
                     new_worker = self._select_worker_for_reassignment(
                         available_workers, exclude_worker_id=current_worker_id
@@ -1498,32 +1770,32 @@ class Orchestrator:
         exclude_worker_id: Optional[str] = None,
     ) -> Optional[Dict[str, Any]]:
         """
-        Select a worker for task reassignment.
+        Select a worker for task reassignment using the WorkerScorer.
 
-        Uses simple round-robin/random selection, excluding the failed worker.
-        Could be enhanced with load balancing or trust-based selection.
-
-        Args:
-            workers: List of available worker dicts
-            exclude_worker_id: Worker to exclude (the one that failed)
-
-        Returns:
-            Selected worker dict or None if no workers available
+        Excludes the failed worker plus any worker hard-excluded by the scorer
+        (hash_mismatch, local_timeout, local_hash, zero_bytes, rejected_flood,
+        overloaded). No exploration bonus in retry mode — we want the safest
+        worker, not a fresh one.
         """
-        import random
-
-        # Filter out the excluded worker and workers with proven 0% success
-        candidates = [
-            w for w in workers
-            if w.get("worker_id") != exclude_worker_id
-            and not (w.get("total_tasks", 0) >= 3 and w.get("success_rate", 1) == 0)
-        ]
-
+        candidates = [w for w in workers if w.get("worker_id") != exclude_worker_id]
         if not candidates:
             return None
 
-        # Simple random selection (could be enhanced with load balancing)
-        return random.choice(candidates)
+        if not getattr(self.settings, "worker_scorer_enabled", True) or not self._scorer:
+            import random
+            fallback = [
+                w for w in candidates
+                if not (w.get("total_tasks", 0) >= 3 and w.get("success_rate", 1) == 0)
+            ]
+            return random.choice(fallback) if fallback else None
+
+        from .worker_scorer import TaskContext
+        ctx = TaskContext()
+        ranked = self._scorer.rank(candidates, ctx, self._epoch_assignments, mode="retry")
+        for worker, sc in ranked:
+            if sc.excluded_reason is None and sc.final > 0:
+                return worker
+        return None
 
     # =========================================================================
     # State & Metrics
@@ -1836,6 +2108,21 @@ class Orchestrator:
                     f"{bytes_transferred} bytes, {bandwidth_mbps:.1f} Mbps"
                 )
 
+                # Cross-UID proven-worker list: workers who actually delivered
+                # bytes get a score boost on all sibling orchestrators. Only
+                # qualify if dr >= 0.5 OR 2+ recent successes — single-success
+                # luck doesn't promote (we've seen workers with dr=0.15 sneak in).
+                try:
+                    from core.worker_scorer import _proven_write as _scorer_proven_write
+                    if worker_id and bytes_transferred > 0:
+                        worker_dr = None
+                        wobj = self.workers.get(worker_id)
+                        if wobj:
+                            worker_dr = getattr(wobj, "delivery_ratio", None)
+                        _scorer_proven_write(worker_id, delivery_ratio=worker_dr)
+                except Exception as e:
+                    logger.debug(f"proven write skipped: {e}")
+
                 # Get worker object for quality multiplier calculation
                 worker = self.workers.get(worker_id)
 
@@ -1878,6 +2165,9 @@ class Orchestrator:
         """
         _t0 = time.monotonic()
         _source = transfer.pop("_source", "unknown")
+
+        # Record arrival for health watchdog (zombie detection).
+        self._last_transfer_received_at = time.time()
 
         transfer_id = transfer.get("transfer_id", "")
         gateway_url = transfer.get("gateway_url", "")
@@ -1932,10 +2222,15 @@ class Orchestrator:
                 "worker_id": w.worker_id,
                 "trust_score": w.trust_score,
                 "success_rate": w.success_rate,
-                "bandwidth_mbps": w.bandwidth_ema,
+                "bandwidth_mbps": w.bandwidth_ema or w.bandwidth_mbps,
                 "load_factor": w.load_factor,
                 "total_tasks": w.total_tasks,
                 "is_affiliated": w.is_affiliated,
+                "region": w.region,
+                "delivery_ratio": w.delivery_ratio,
+                "latency_p50_ms": w.latency_p50_ms,
+                "reputation_score": w.reputation_score,
+                "failure_reasons": dict(w.failure_reasons or {}),
             })
         if skipped_poor:
             logger.info(f"Skipped {skipped_poor} workers with 0% success rate (10+ tasks)")
@@ -2070,86 +2365,121 @@ class Orchestrator:
         chunks: List[Dict[str, Any]],
         chunk_start: int,
         chunk_end: int,
+        source_region: str = "",
+        dest_region: str = "",
     ) -> List[Dict[str, Any]]:
         """
-        Assign chunks to workers, strongly preferring affiliated/SLA workers.
+        Assign chunks to workers using the unified scoring engine.
 
         Only assigns chunks in the range [chunk_start, chunk_end] (inclusive).
-
-        Strategy:
-        1. Use affiliated workers FIRST (exclusive to our orchestrator)
-        2. Fill remaining chunks with best global pool workers
-        3. Each worker gets 1 chunk before any gets 2 (round-robin)
-
         Returns list of assignments: [{"worker_id": "...", "chunk_indices": [17, 18, 19]}, ...]
         """
         if not workers:
             return []
 
         chunk_indices = list(range(chunk_start, chunk_end + 1))
+        if not chunk_indices:
+            return []
 
-        # Separate affiliated vs global pool workers
-        affiliated = [w for w in workers if w.get("is_affiliated")]
-        global_pool = [w for w in workers if not w.get("is_affiliated")]
-
-        # Score workers — success rate is king (60%), then bandwidth (25%), trust (15%)
-        def worker_score(w: Dict[str, Any]) -> float:
-            success = float(w.get("success_rate", 0))
-            total_tasks = int(w.get("total_tasks", 0))
-            bandwidth = float(w.get("bandwidth_mbps", 0))
-            trust = float(w.get("trust_score", 0.5))
-            # Normalize
-            success_norm = success / 100.0 if success > 1 else success
-            bw_norm = min(2.0, max(0.1, bandwidth / 100.0))
-            # New workers with no history get moderate score
-            if total_tasks < 3:
-                success_norm = 0.3
-            return (success_norm * 0.60) + (bw_norm * 0.25) + (trust * 0.15)
-
-        # Sort each group by score (best first)
-        affiliated.sort(key=worker_score, reverse=True)
-        global_pool.sort(key=worker_score, reverse=True)
-
-        # Build final list: all affiliated first (sorted by success), then top global
-        max_global = max(2, len(chunk_indices) - len(affiliated))
-        selected = affiliated + global_pool[:max_global]
+        if getattr(self.settings, "worker_scorer_enabled", True):
+            selected = self._rank_workers_with_scorer(
+                workers, source_region, dest_region, len(chunk_indices)
+            )
+        else:
+            selected = self._rank_workers_legacy(workers, len(chunk_indices))
 
         if not selected:
+            logger.error(
+                f"Chunk assignment: all {len(workers)} workers excluded — no assignments produced"
+            )
             return []
 
         worker_ids = [w["worker_id"] for w in selected]
-
-        # Log with scores
-        aff_scores = [(w["worker_id"][:12], f"{worker_score(w):.2f}") for w in affiliated[:3]]
-        logger.info(
-            f"Chunk assignment: {len(affiliated)} affiliated + {min(max_global, len(global_pool))} global "
-            f"= {len(selected)} workers for {len(chunk_indices)} chunks "
-            f"(top affiliated: {aff_scores})"
-        )
-
-        # Initialize assignments for each worker
-        worker_assignments = {wid: [] for wid in worker_ids}
-
-        # Assign chunks round-robin — best workers get first chunks
+        worker_assignments: Dict[str, List[int]] = {wid: [] for wid in worker_ids}
         for i, chunk_idx in enumerate(chunk_indices):
-            worker_id = worker_ids[i % len(worker_ids)]
-            worker_assignments[worker_id].append(chunk_idx)
+            worker_assignments[worker_ids[i % len(worker_ids)]].append(chunk_idx)
 
-        # Log assignment
-        if chunk_indices:
-            top_worker = selected[0] if selected else {}
-            logger.debug(
-                f"Assignment: {len(chunk_indices)} chunks to {len(worker_ids)} workers, "
-                f"top worker={top_worker.get('worker_id', '?')[:16]} "
-                f"(affiliated={top_worker.get('is_affiliated', False)})"
-            )
-
-        # Convert to list format
+        self._epoch_assignments += len(chunk_indices)
         return [
             {"worker_id": wid, "chunk_indices": indices}
             for wid, indices in worker_assignments.items()
             if indices
         ]
+
+    def _rank_workers_with_scorer(
+        self,
+        workers: List[Dict[str, Any]],
+        source_region: str,
+        dest_region: str,
+        chunk_count: int,
+    ) -> List[Dict[str, Any]]:
+        """Rank workers via WorkerScorer. Returns the selected subset."""
+        from .worker_scorer import TaskContext
+
+        ctx = TaskContext(source_region=source_region, dest_region=dest_region)
+        ranked = self._scorer.rank(workers, ctx, self._epoch_assignments, mode="chunked")
+
+        picked = [(w, sc) for w, sc in ranked if sc.excluded_reason is None and sc.final > 0]
+        excluded = [(w, sc) for w, sc in ranked if sc.excluded_reason is not None]
+
+        # Guardrail: everyone hard-excluded — retry with only catastrophic filters
+        if not picked and excluded:
+            logger.critical(
+                f"Chunk assignment: all {len(workers)} workers hard-excluded "
+                f"(reasons={self._summarize_exclusions(excluded)}); falling back to legacy ranking"
+            )
+            return self._rank_workers_legacy(workers, chunk_count)
+
+        max_workers = max(chunk_count, 2)
+        selected = [w for w, _sc in picked[:max_workers]]
+
+        # One-line batch summary for prod observability
+        reason_summary = self._summarize_exclusions(excluded)
+        top = [
+            f"{w.get('worker_id', '?')[:8]}:{sc.final:.2f}"
+            for w, sc in picked[:3]
+        ]
+        logger.info(
+            f"assign picked/scored/excluded={len(selected)}/{len(workers)}/{len(excluded)} "
+            f"reasons={reason_summary} top={top}"
+        )
+        return selected
+
+    @staticmethod
+    def _summarize_exclusions(excluded: List[Any]) -> Dict[str, int]:
+        summary: Dict[str, int] = {}
+        for _w, sc in excluded:
+            reason = sc.excluded_reason or "unknown"
+            summary[reason] = summary.get(reason, 0) + 1
+        return summary
+
+    @staticmethod
+    def _rank_workers_legacy(
+        workers: List[Dict[str, Any]],
+        chunk_count: int,
+    ) -> List[Dict[str, Any]]:
+        """Original 60/25/15 scoring — fallback when scorer is disabled or explodes."""
+        def worker_score(w: Dict[str, Any]) -> float:
+            success = float(w.get("success_rate", 0))
+            total_tasks = int(w.get("total_tasks", 0))
+            bandwidth = float(w.get("bandwidth_mbps", 0))
+            trust = float(w.get("trust_score", 0.5))
+            success_norm = success / 100.0 if success > 1 else success
+            bw_norm = min(2.0, max(0.1, bandwidth / 100.0))
+            if total_tasks < 3:
+                success_norm = 0.3
+            return (success_norm * 0.60) + (bw_norm * 0.25) + (trust * 0.15)
+
+        affiliated = sorted(
+            [w for w in workers if w.get("is_affiliated")],
+            key=worker_score, reverse=True,
+        )
+        global_pool = sorted(
+            [w for w in workers if not w.get("is_affiliated")],
+            key=worker_score, reverse=True,
+        )
+        max_global = max(2, chunk_count - len(affiliated))
+        return affiliated + global_pool[:max_global]
 
     async def _init_orch_manager(self) -> None:
         """Initialize the orchestrator manager for incentive mechanism."""
@@ -2279,6 +2609,10 @@ class Orchestrator:
             success_rate=1.0,
             trust_score=1.0,
             max_concurrent_tasks=100,
+            delivery_ratio=1.0,
+            latency_p50_ms=50.0,
+            reputation_score=1.0,
+            failure_reasons={},
         )
 
         self.workers[mock_worker.worker_id] = mock_worker

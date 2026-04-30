@@ -28,7 +28,7 @@ module.exports = {
       TASK_TIMEOUT: '120',
       ALPHA_PER_CHUNK: '0.5',
       READY: 'true',
-      BEAMCORE_API_KEY: 'b1m_43ce5d13d0440015593bbcc990f124beddeed57b3df92a7e',
+      BEAMCORE_API_KEY: 'b1m_562d862c929dfdc397abf35aa83f417c5476f2118dd7a550',
       DATABASE_URL: 'postgresql+asyncpg://beam:beam123@localhost:5432/beam_orchestrator',
     }
   }]

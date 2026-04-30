@@ -22,13 +22,21 @@ module.exports = {
       MAX_WORKERS: '10000',
       WORKER_TIMEOUT: '300',
       MIN_WORKER_BANDWIDTH: '10.0',
-      WORKER_HEARTBEAT_INTERVAL: '60',
+      WORKER_HEARTBEAT_INTERVAL: '30',
       WORKER_SYNC_INTERVAL: '30',
-      MAX_CONCURRENT_TASKS: '1000',
-      TASK_TIMEOUT: '120',
+      MAX_CONCURRENT_TASKS: '5000',
+      TASK_TIMEOUT: '180',
       ALPHA_PER_CHUNK: '0.5',
       READY: 'true',
       DATABASE_URL: 'postgresql+asyncpg://beam:beam123@localhost:5432/beam_orchestrator',
+      BEAMCORE_API_KEY: 'b1m_ce5ad0028c626900876ed5a23b9ea8cfa9e74265dd2f28c1',
+      // Now in top-tier — every chunk counts. Stricter than default (10/0.5).
+      BEAM_SCORER_MIN_DR_SAMPLE: '5',
+      BEAM_SCORER_MIN_DR: '0.55',
+      // Cold-start hoarding cutoff: 3 pending tasks with 0 completed → exclude.
+      BEAM_SCORER_HOARDING_PENDING: '3',
+      // Stronger preference for workers we've seen successfully deliver.
+      BEAM_PROVEN_MULT: '5.0',
     }
   }]
 };

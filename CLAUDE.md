@@ -185,9 +185,62 @@ Validators fetch `/pob/epoch/{epoch}/summaries` from BeamCore. Only orchestrator
 
 Workers register with BeamCore globally. They must be **affiliated** with an orchestrator to count toward that orchestrator's `active_workers` and receive tasks from it. Without affiliation, workers are in a global pool and may be assigned to other orchestrators.
 
-### Current Deployment (UID 115)
+**SLA affiliation (preferred, no worker restart needed):**
+```
+POST /sla/orchestrators/{uid}/workers/join
+Body: { worker_id, hotkey, ip, port, signature }
+Signature: worker signs "{worker_id}:{orchestrator_hotkey}" with worker's hotkey
+```
 
-- Orchestrator: `beam` (pm2), hotkey `dream-001`, UID 115, slot 30
-- Workers: `beam-w5` through `beam-w14` (pm2), hotkeys `dream-005` to `dream-014`
-- Server: 95.217.67.193 (Hetzner Finland), registered as region US
-- Known issue: BeamCore alpha stake cache shows 0.0 despite 31.60 on-chain
+## Payment Pipeline (Critical)
+
+Payment must end with `⛓ confirmed` (`pop_verified=true`) to build compliance. The verified flow:
+
+```
+1. Worker completes task → task_result received via WS
+2. GET /orchestrators/tasks/{id}/payment-address → get worker_id + amount_owed
+3. GET /orchestrators/workers/{worker_id}/coldkey → get ACTUAL coldkey
+4. GET /pob/{task_id}/validate-transfer → get transfer_id
+5. Publish PoB WITH worker_coldkey field (critical — without it verification fails)
+6. On-chain: batch_all(
+     remark_with_event("{transfer_id}:{task_id}"),
+     SubtensorModule.transfer_stake(destination_coldkey=worker_coldkey, alpha_amount=500_000_000)
+   )
+7. POST /pob/{task_id}/payment { tx_hash, amount_rao }
+8. BeamCore verifies: coldkey in PoB matches on-chain dest → ⛓ confirmed
+```
+
+**Critical gotchas:**
+- `payment-address` API returns a DERIVED address — do NOT use for `transfer_stake` destination (causes `Recipient mismatch`)
+- PoBSubmission MUST include `worker_coldkey` or verifier returns "Missing worker_coldkey"
+- `transfer_stake` minimum is ~0.5 ALPHA (500M RAO)
+- Memo MUST be exactly `{transfer_id}:{task_id}` — wrong memo = validator compliance penalty
+- `pop_verified: null` means async pending (not failure); `false` means wrong destination
+- Worker coldkey balance (TAO) needed for tx fees, not just staked ALPHA
+
+**Compliance formula:** `traffic_compliance = paid_verified_tasks / total_assigned_tasks`. Zero compliance → zero `combined_weight` → no traffic → stuck. Need verified payments to break out.
+
+## Worker Assignment Strategy
+
+`_assign_chunks_to_workers` in `orchestrator.py`:
+1. Separate workers into `affiliated` (is_affiliated=True) vs `global_pool`
+2. Sort each group by score: 60% success_rate + 25% bandwidth + 15% trust
+3. Build list: all affiliated first, then top-N global pool workers
+4. Round-robin chunk assignment across selected workers
+5. Only assign to workers with heartbeat < 60s ago
+
+Workers must **accept tasks from ALL orchestrators** (not just affiliated ones) to avoid "stuck tasks" disconnections from BeamCore. `BEAM_ORCHESTRATOR_HOTKEYS` only controls affiliation, not task filtering.
+
+## Deployment Notes
+
+**PM2 ecosystem configs**: `neurons/orchestrator/ecosystem.*.config.js` per orchestrator, `neurons/worker/ecosystem.*.config.js` for workers. Each config sets `BT_WALLET_PASSWORD`, `DATABASE_URL`, `ALPHA_PER_CHUNK=0.5`, `READY=true`.
+
+**Coldkey password handling**: If `BT_WALLET_PASSWORD` env var doesn't decrypt the coldkey (encryption encoding mismatch), re-encrypt using:
+```python
+import bittensor_wallet
+kp = bittensor_wallet.Keypair.create_from_mnemonic(mnemonic)
+kf = bittensor_wallet.Keyfile(path="/root/.bittensor/wallets/{name}/coldkey")
+kf.set_keypair(kp, encrypt=True, overwrite=True, password="{name}")
+```
+
+**Worker registration cap**: BeamCore caps at 250 active workers globally. Use `BEAM_WORKER_STAGGER` env to jitter registration and avoid rate-limit storms.
