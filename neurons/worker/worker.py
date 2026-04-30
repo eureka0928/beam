@@ -80,6 +80,8 @@ WS_RECONNECT_MIN_DELAY = 12.0   # must exceed server's 10s cooldown
 WS_RECONNECT_MAX_DELAY = 60.0
 WS_RECONNECT_MULTIPLIER = 2.0
 WS_MAX_RECONNECT_ATTEMPTS = 10
+
+WS_HTTP_FALLBACK_STATUS_CODES = {404, 426, 501}
 WS_HEARTBEAT_INTERVAL = 25      # seconds
 
 # Transfer settings
@@ -98,6 +100,7 @@ class WorkerState:
     """Worker runtime state."""
     wallet: Any  # bittensor.wallet
     api_url: str
+    buffer_url: Optional[str] = None
     worker_id: Optional[str] = None
     api_key: Optional[str] = None
     orchestrator_hotkey: Optional[str] = None
@@ -310,21 +313,6 @@ async def complete_task(
         }
         if chunk_hash: payload["chunk_hash"] = chunk_hash
         if error: payload["error"] = error
-        response = await client.post(
-            f"{state.api_url}/workers/tasks/complete",
-            json=payload,
-            headers={"X-Worker-Hotkey": state.wallet.hotkey.ss58_address},
-            timeout=10.0,
-        )
-        data = response.json()
-        return data.get("success", False)
-    except Exception as e:
-        print(f"[Worker] Complete task error: {e}")
-        return False
-            payload["chunk_hash"] = chunk_hash
-        if error:
-            payload["error"] = error
-
         response = await client.post(
             f"{state.api_url}/workers/tasks/complete",
             json=payload,
@@ -705,9 +693,9 @@ async def handle_task(state: WorkerState, task: dict) -> bool:
 # =============================================================================
 
 
-def get_ws_url(worker_id: str, api_key: str, api_url: str) -> str:
+def get_ws_url(worker_id: str, api_key: str, api_url: str, buffer_url: Optional[str] = None) -> str:
     """Convert API URL to WebSocket URL for worker connection."""
-    base = api_url.rstrip("/")
+    base = (buffer_url or api_url).rstrip("/")
     if base.startswith("https://"):
         ws_base = "wss://" + base[8:]
     elif base.startswith("http://"):
@@ -718,6 +706,27 @@ def get_ws_url(worker_id: str, api_key: str, api_url: str) -> str:
     if api_key:
         url = f"{url}?api_key={api_key}"
     return url
+
+
+def get_ws_status_code(exc: Exception) -> Optional[int]:
+    """Extract an HTTP status code from websocket handshake failures."""
+    status_code = getattr(exc, "status_code", None)
+    if isinstance(status_code, int):
+        return status_code
+
+    response = getattr(exc, "response", None)
+    response_status = getattr(response, "status_code", None)
+    if isinstance(response_status, int):
+        return response_status
+
+    message = str(exc)
+    for token in message.split():
+        stripped = token.rstrip(":,)")
+        if stripped.isdigit():
+            value = int(stripped)
+            if 100 <= value <= 599:
+                return value
+    return None
 
 
 async def ws_send_heartbeat(websocket, state: WorkerState) -> bool:
@@ -890,9 +899,6 @@ async def handle_ws_task(state: WorkerState, websocket, task: dict) -> bool:
 
     return success
 
-    return success
-
-
 async def websocket_loop(state: WorkerState):
     """WebSocket communication loop with automatic reconnection."""
     if not WEBSOCKETS_AVAILABLE:
@@ -900,7 +906,7 @@ async def websocket_loop(state: WorkerState):
         state.use_websocket = False
         return
 
-    ws_url = get_ws_url(state.worker_id, state.api_key, state.api_url)
+    ws_url = get_ws_url(state.worker_id, state.api_key, state.api_url, state.buffer_url)
     print(f"[Worker] Connecting to WebSocket: {ws_url.split('?')[0]}")
     reconnect_delay = WS_RECONNECT_MIN_DELAY
 
@@ -985,11 +991,20 @@ async def websocket_loop(state: WorkerState):
                 print(f"[Worker] [WS] Server has WebSocket disabled, falling back to HTTP polling")
                 state.use_websocket = False
                 return
+            if e.status_code in WS_HTTP_FALLBACK_STATUS_CODES:
+                print(f"[Worker] [WS] Server does not expose worker WebSocket, falling back to HTTP polling")
+                state.use_websocket = False
+                return
 
         except ConnectionRefusedError:
             print(f"[Worker] [WS] Connection refused")
 
         except Exception as e:
+            status_code = get_ws_status_code(e)
+            if status_code in WS_HTTP_FALLBACK_STATUS_CODES:
+                print(f"[Worker] [WS] Worker WebSocket unavailable (HTTP {status_code}), falling back to HTTP polling")
+                state.use_websocket = False
+                return
             print(f"[Worker] [WS] Connection error: {type(e).__name__}: {e}")
 
         state.ws_connected = False
@@ -1165,12 +1180,15 @@ async def main():
     else:
         api_url = os.environ.get("SUBNET_CORE_URL", MAINNET_URL)
         print(f"Network: mainnet")
+    buffer_url = os.environ.get("BUFFER_URL")
 
     print(f"API URL: {api_url}")
+    if buffer_url:
+        print(f"Buffer URL: {buffer_url}")
     print()
 
     # Create worker state
-    state = WorkerState(wallet=wallet, api_url=api_url)
+    state = WorkerState(wallet=wallet, api_url=api_url, buffer_url=buffer_url)
 
     # Setup signal handlers
     loop = asyncio.get_running_loop()
