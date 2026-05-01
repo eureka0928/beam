@@ -70,3 +70,19 @@ htmlcov/
 # Bittensor
 wallets/
 ~/.bittensor/
+
+# Local Claude config
+.claude/
+
+# Local ecosystem configs (contain API keys)
+neurons/orchestrator/ecosystem.*.config.js
+neurons/worker/ecosystem.*.config.js
+
+# Local helper / payment / audit scripts (contain API keys)
+auto_pay_unpaid.py
+auto_pool_audit.py
+monitor_payment_check.py
+sla_join_all.py
+sla_join_uid164.py
+repay_uid69.sh
+repay_with_correct_memo.sh
